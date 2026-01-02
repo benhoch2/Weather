@@ -266,6 +266,8 @@
     </div>
 
     <script>
+        let currentLimit = 20;
+        
         async function loadStatistics() {
             try {
                 const response = await fetch('/api/statistics');
@@ -328,10 +330,10 @@
             }
         }
 
-        async function loadPredictions() {
+        async function loadPredictions(append = false) {
             try {
-                // Load only last 20 predictions for faster loading
-                const response = await fetch('/api/predictions?limit=20');
+                // Load predictions with current limit
+                const response = await fetch(`/api/predictions?limit=${currentLimit}`);
                 const predictions = await response.json();
                 
                 const grid = document.getElementById('predictions-grid');
@@ -339,7 +341,7 @@
                 // Filter to show only completed predictions (with comparisons)
                 const completed = predictions.filter(p => p.comparison_file);
                 
-                if (completed.length === 0) {
+                if (completed.length === 0 && !append) {
                     grid.innerHTML = `
                         <div class="no-predictions">
                             <h2>No Completed Predictions Yet</h2>
@@ -349,14 +351,14 @@
                     return;
                 }
                 
-                grid.innerHTML = '';
+                if (!append) {
+                    grid.innerHTML = '';
+                }
                 
-                // Add "Load More" button if there might be more predictions
-                if (completed.length === 20) {
-                    const loadMoreInfo = document.createElement('div');
-                    loadMoreInfo.style.cssText = 'grid-column: 1 / -1; text-align: center; padding: 20px; background: white; border-radius: 15px;';
-                    loadMoreInfo.innerHTML = '<p style="color: #667eea; font-size: 1.1em;">Showing last 20 predictions for faster loading</p>';
-                    grid.appendChild(loadMoreInfo);
+                // Remove old load more button if it exists
+                const oldLoadMore = document.getElementById('load-more-btn');
+                if (oldLoadMore) {
+                    oldLoadMore.remove();
                 }
                 
                 completed.forEach(pred => {
@@ -420,6 +422,31 @@
                     
                     grid.appendChild(card);
                 });
+                
+                // Add "Load More" button if we got the full limit from API (more predictions might exist)
+                if (predictions.length === currentLimit) {
+                    const loadMoreBtn = document.createElement('div');
+                    loadMoreBtn.id = 'load-more-btn';
+                    loadMoreBtn.style.cssText = 'grid-column: 1 / -1; text-align: center; padding: 20px;';
+                    loadMoreBtn.innerHTML = `
+                        <button onclick="loadMorePredictions()" style="
+                            background: white;
+                            color: #667eea;
+                            border: 2px solid #667eea;
+                            padding: 15px 40px;
+                            border-radius: 10px;
+                            font-size: 1.1em;
+                            cursor: pointer;
+                            font-weight: bold;
+                            transition: all 0.3s;
+                        " onmouseover="this.style.background='#667eea'; this.style.color='white';" 
+                           onmouseout="this.style.background='white'; this.style.color='#667eea';">
+                            📦 Load More Predictions
+                        </button>
+                        <p style="color: white; margin-top: 10px; font-size: 0.9em;">Currently showing ${completed.length} predictions</p>
+                    `;
+                    grid.appendChild(loadMoreBtn);
+                }
             } catch (error) {
                 console.error('Error loading predictions:', error);
                 document.getElementById('predictions-grid').innerHTML = `
@@ -429,6 +456,11 @@
                     </div>
                 `;
             }
+        }
+        
+        function loadMorePredictions() {
+            currentLimit += 20;  // Load 20 more
+            loadPredictions();
         }
 
         function openModal(imageSrc) {
