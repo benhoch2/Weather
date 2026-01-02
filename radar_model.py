@@ -8,7 +8,7 @@ class RadarPredictionModel:
     ConvLSTM-based model for predicting the next radar image.
     """
     
-    def __init__(self, sequence_length=12, image_size=(256, 256), channels=3):
+    def __init__(self, sequence_length=12, image_size=(512, 512), channels=3):
         """
         Initialize the model.
         
@@ -37,8 +37,9 @@ class RadarPredictionModel:
         )
         
         # ConvLSTM layers - these process the sequence while maintaining spatial structure
+        # Using 32 filters instead of 64 to reduce memory usage for 512x512 images
         x = layers.ConvLSTM2D(
-            filters=64,
+            filters=32,
             kernel_size=(3, 3),
             padding='same',
             return_sequences=True,
@@ -47,16 +48,7 @@ class RadarPredictionModel:
         x = layers.BatchNormalization()(x)
         
         x = layers.ConvLSTM2D(
-            filters=64,
-            kernel_size=(3, 3),
-            padding='same',
-            return_sequences=True,
-            activation='relu'
-        )(x)
-        x = layers.BatchNormalization()(x)
-        
-        x = layers.ConvLSTM2D(
-            filters=64,
+            filters=32,
             kernel_size=(3, 3),
             padding='same',
             return_sequences=False,  # Only return the last output
@@ -66,14 +58,14 @@ class RadarPredictionModel:
         
         # Decoder - convert the ConvLSTM output back to an image
         x = layers.Conv2D(
-            filters=64,
+            filters=32,
             kernel_size=(3, 3),
             padding='same',
             activation='relu'
         )(x)
         
         x = layers.Conv2D(
-            filters=32,
+            filters=16,
             kernel_size=(3, 3),
             padding='same',
             activation='relu'

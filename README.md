@@ -64,13 +64,14 @@ python predict_continuous.py
 ```
 
 This script will:
-1. Wait for enough images (12) to make a prediction
-2. Predict the next radar image (5 minutes ahead)
-3. Save the prediction
-4. Wait 5 minutes for the actual image to arrive
-5. Compare prediction with actual image (calculate MSE, MAE, PSNR)
-6. Update the model weights based on the error (online learning)
-7. Repeat indefinitely
+1. Wait for enough images (12) to make predictions
+2. **Predict the next 5 radar images** (5, 10, 15, 20, 25 minutes ahead)
+3. Save predictions as individual frames and animated GIF
+4. Wait 25 minutes for the actual images to arrive
+5. Compare predictions with actual images (calculate MSE, MAE, PSNR for each frame)
+6. Create animated GIF showing predicted vs actual side-by-side
+7. Update the model weights based on the error (online learning)
+8. Repeat indefinitely
 
 The model continuously improves as it sees more real-world data!
 
@@ -84,7 +85,9 @@ Then open your browser and go to: **http://localhost:5000**
 
 The web interface shows:
 - All prediction comparisons (predicted vs actual side-by-side)
+- **Animated GIFs showing 5-frame predictions**
 - Metrics for each prediction (MSE, MAE, PSNR)
+- Average metrics across all 5 frames
 - Overall statistics
 - Auto-refreshes every 30 seconds
 - Click any image to view full-size
@@ -93,9 +96,10 @@ The web interface shows:
 
 ### Architecture
 The system uses a **ConvLSTM (Convolutional LSTM)** architecture:
-- Input: 12 consecutive radar images (256x256 RGB)
+- Input: 12 consecutive radar images (256x256 or 512x512 RGB)
 - ConvLSTM layers capture both spatial (weather patterns) and temporal (movement) features
-- Output: Predicted next radar image (5 minutes into the future)
+- Output: Single predicted radar image (5 minutes into the future)
+- **Multi-frame prediction:** Recursively predicts 5 frames (25 minutes ahead) by feeding predictions back as input
 
 ### Online Learning
 After each prediction:
@@ -113,9 +117,10 @@ After each prediction:
 ## File Outputs
 
 - `radar_TIMESTAMP.png` - Original radar images
-- `predicted_TIMESTAMP.png` - Predicted images
+- `predicted_TIMESTAMP.png` / `predicted_TIMESTAMP_frameN.png` - Predicted images
 - `prediction_comparison_TIMESTAMP.png` - Side-by-side comparison (predicted | actual)
-- `metrics_TIMESTAMP.json` - Prediction metrics (MSE, MAE, PSNR)
+- `prediction_animation_TIMESTAMP.gif` - Animated GIF showing 5-frame prediction vs actual
+- `metrics_TIMESTAMP.json` - Prediction metrics (MSE, MAE, PSNR) for each frame
 - `radar_model.keras` - Trained model
 - `training_metadata.json` - Training statistics and metadata
 

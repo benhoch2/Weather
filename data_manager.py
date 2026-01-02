@@ -10,7 +10,7 @@ class RadarDataManager:
     Manages radar image data for training and prediction.
     """
     
-    def __init__(self, data_dir=".", sequence_length=12, image_size=(256, 256)):
+    def __init__(self, data_dir="data/radar_images", sequence_length=12, image_size=(512, 512)):
         """
         Initialize the data manager.
         
@@ -158,6 +158,81 @@ class RadarDataManager:
             with open(filepath, 'r') as f:
                 return json.load(f)
         return None
+    
+    def data_generator(self, batch_size=1, validation_split=0.2, training=True):
+        """
+        Generator that yields batches of sequences on-the-fly without loading all data into memory.
+        
+        Args:
+            batch_size: Number of sequences per batch
+            validation_split: Fraction of data to use for validation
+            training: If True, yields training data; if False, yields validation data
+        
+        Yields:
+            Tuple of (X_batch, y_batch) where:
+                X_batch: array of shape (batch_size, sequence_length, height, width, channels)
+                y_batch: array of shape (batch_size, height, width, channels)
+        """
+        images = self.get_all_radar_images()
+        
+        if len(images) < self.sequence_length + 1:
+            raise ValueError(f"Not enough images. Need at least {self.sequence_length + 1}, found {len(images)}")
+        
+        # Calculate number of possible sequences
+        num_sequences = len(images) - self.sequence_length
+        split_idx = int((1 - validation_split) * num_sequences)
+        
+        # Determine which sequences to use
+        if training:
+            start_idx = 0
+            end_idx = split_idx
+        else:
+            start_idx = split_idx
+            end_idx = num_sequences
+        
+        while True:  # Infinite loop for keras fit
+            # Shuffle indices for training
+            indices = list(range(start_idx, end_idx))
+            if training:
+                np.random.shuffle(indices)
+            
+            # Generate batches
+            for batch_start in range(0, len(indices), batch_size):
+                batch_indices = indices[batch_start:batch_start + batch_size]
+                
+                X_batch = []
+                y_batch = []
+                
+                for i in batch_indices:
+                    # Load sequence of images
+                    sequence = []
+                    for j in range(self.sequence_length):
+                        img = self.load_image(images[i + j][1])
+                        sequence.append(img)
+                    
+                    # Load target image
+                    target = self.load_image(images[i + self.sequence_length][1])
+                    
+                    X_batch.append(sequence)
+                    y_batch.append(target)
+                
+                # Convert to numpy arrays
+                X_batch = np.array(X_batch, dtype=np.float32)
+                y_batch = np.array(y_batch, dtype=np.float32)
+                
+                yield X_batch, y_batch
+    
+    def get_num_sequences(self):
+        """
+        Get the total number of sequences that can be created from available images.
+        
+        Returns:
+            Number of sequences
+        """
+        images = self.get_all_radar_images()
+        if len(images) < self.sequence_length + 1:
+            return 0
+        return len(images) - self.sequence_length
 
 
 if __name__ == "__main__":

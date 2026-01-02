@@ -17,13 +17,18 @@ ENV/
 *.h5
 *.pb
 
-# Data files - images
+# Data files - images and predictions
+data/radar_images/
+data/predictions/
 radar_*.png
 predicted_*.png
-prediction_comparison_*.png
+prediction_*.png
+prediction_*.gif
+actual_*.png
 
 # Metadata files
 *.json
+!package.json
 
 # Flask
 instance/

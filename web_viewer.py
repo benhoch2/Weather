@@ -1,4 +1,4 @@
-from flask import Flask, render_template, jsonify, send_file
+from flask import Flask, render_template, jsonify, send_file, request
 from pathlib import Path
 import json
 from datetime import datetime
@@ -11,51 +11,73 @@ class PredictionViewer:
     Manages viewing of radar predictions and comparisons.
     """
     
-    def __init__(self, data_dir="."):
+    def __init__(self, data_dir="data/predictions"):
         self.data_dir = Path(data_dir)
     
     def get_all_predictions(self):
         """
         Get all predictions with their metadata.
+        Returns both pending (prediction-only) and completed (with actuals).
+        Backward compatible with old prediction format.
         
         Returns:
             List of dictionaries containing prediction info
         """
         predictions = []
         
-        # Find all comparison images
-        for file in sorted(self.data_dir.glob("prediction_comparison_*.png"), reverse=True):
+        # Find all prediction-only GIFs (new format - active predictions)
+        for file in sorted(self.data_dir.glob("prediction_only_*.gif"), reverse=True):
             try:
-                # Extract timestamp from filename
-                match = re.search(r'prediction_comparison_(\d+)\.png', file.name)
+                match = re.search(r'prediction_only_(\d+)\.gif', file.name)
+                if not match:
+                    continue
+                
+                timestamp = int(match.group(1))
+                current_time = int(datetime.now().timestamp())
+                
+                # Check if evaluation is complete (comparison file exists)
+                comparison_file = self.data_dir / f"prediction_animation_{timestamp}.gif"
+                is_evaluated = comparison_file.exists()
+                
+                # Calculate time remaining until evaluation (25 minutes from prediction)
+                eval_time = timestamp + 25 * 60
+                time_remaining = max(0, eval_time - current_time)
+                minutes_remaining = time_remaining // 60
+                
+                prediction_info = {
+                    'timestamp': timestamp,
+                    'datetime': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
+                    'prediction_file': file.name,
+                    'is_active': not is_evaluated and time_remaining > 0,
+                    'minutes_remaining': minutes_remaining if not is_evaluated else 0,
+                    'comparison_file': comparison_file.name if is_evaluated else None,
+                    'metrics': self.load_metrics(timestamp) if is_evaluated else None
+                }
+                
+                predictions.append(prediction_info)
+            except (ValueError, IndexError):
+                continue
+        
+        # Also find old format predictions (comparison animations)
+        for file in sorted(self.data_dir.glob("prediction_animation_*.gif"), reverse=True):
+            try:
+                match = re.search(r'prediction_animation_(\d+)\.gif', file.name)
                 if not match:
                     continue
                 
                 timestamp = int(match.group(1))
                 
-                # Look for corresponding predicted and actual images
-                predicted_file = self.data_dir / f"predicted_{timestamp}.png"
-                
-                # Find the actual radar image (closest in time)
-                target_time = timestamp + 5 * 60
-                actual_files = list(self.data_dir.glob(f"radar_{target_time}*.png"))
-                if not actual_files:
-                    # Search for radar image within +/- 2 minutes
-                    actual_files = []
-                    for t in range(target_time - 120, target_time + 120):
-                        files = list(self.data_dir.glob(f"radar_{t}.png"))
-                        if files:
-                            actual_files = files
-                            break
-                
-                actual_file = actual_files[0] if actual_files else None
+                # Skip if already added from prediction_only
+                if any(p['timestamp'] == timestamp for p in predictions):
+                    continue
                 
                 prediction_info = {
                     'timestamp': timestamp,
                     'datetime': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
-                    'comparison_image': file.name,
-                    'predicted_image': predicted_file.name if predicted_file.exists() else None,
-                    'actual_image': actual_file.name if actual_file else None,
+                    'prediction_file': None,
+                    'is_active': False,
+                    'minutes_remaining': 0,
+                    'comparison_file': file.name,
                     'metrics': self.load_metrics(timestamp)
                 }
                 
@@ -63,7 +85,45 @@ class PredictionViewer:
             except (ValueError, IndexError):
                 continue
         
+        # Fallback: old static comparison images
+        for file in sorted(self.data_dir.glob("prediction_comparison_*.png"), reverse=True):
+            try:
+                match = re.search(r'prediction_comparison_(\d+)\.png', file.name)
+                if not match:
+                    continue
+                
+                timestamp = int(match.group(1))
+                
+                # Skip if already added
+                if any(p['timestamp'] == timestamp for p in predictions):
+                    continue
+                
+                prediction_info = {
+                    'timestamp': timestamp,
+                    'datetime': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
+                    'prediction_file': None,
+                    'is_active': False,
+                    'minutes_remaining': 0,
+                    'comparison_file': file.name,
+                    'metrics': self.load_metrics(timestamp)
+                }
+                
+                predictions.append(prediction_info)
+            except (ValueError, IndexError):
+                continue
+        
+        # Sort by timestamp descending
+        predictions.sort(key=lambda x: x['timestamp'], reverse=True)
+        
         return predictions
+    
+    def get_latest_active_prediction(self):
+        """
+        Get the most recent active prediction (not yet evaluated).
+        """
+        predictions = self.get_all_predictions()
+        active = [p for p in predictions if p['is_active']]
+        return active[0] if active else None
     
     def load_metrics(self, timestamp):
         """
@@ -101,9 +161,14 @@ class PredictionViewer:
                 'avg_psnr': None
             }
         
-        avg_mse = sum(m['mse'] for m in metrics_list) / len(metrics_list)
-        avg_mae = sum(m['mae'] for m in metrics_list) / len(metrics_list)
-        avg_psnr = sum(m['psnr'] for m in metrics_list) / len(metrics_list)
+        # Handle missing keys gracefully
+        mse_values = [m['mse'] for m in metrics_list if 'mse' in m]
+        mae_values = [m['mae'] for m in metrics_list if 'mae' in m]
+        psnr_values = [m['psnr'] for m in metrics_list if 'psnr' in m]
+        
+        avg_mse = sum(mse_values) / len(mse_values) if mse_values else None
+        avg_mae = sum(mae_values) / len(mae_values) if mae_values else None
+        avg_psnr = sum(psnr_values) / len(psnr_values) if psnr_values else None
         
         return {
             'total_predictions': len(predictions),
@@ -122,9 +187,18 @@ def index():
 
 @app.route('/api/predictions')
 def get_predictions():
-    """API endpoint to get all predictions."""
+    """API endpoint to get predictions with pagination."""
+    limit = int(request.args.get('limit', 20))  # Default: last 20 predictions
     predictions = viewer.get_all_predictions()
-    return jsonify(predictions)
+    
+    # Return only the most recent predictions
+    return jsonify(predictions[:limit])
+
+@app.route('/api/current_prediction')
+def get_current_prediction():
+    """API endpoint to get the current active prediction."""
+    current = viewer.get_latest_active_prediction()
+    return jsonify(current if current else {})
 
 @app.route('/api/statistics')
 def get_statistics():

@@ -55,29 +55,66 @@ def save_prediction_comparison(predicted, actual, timestamp):
     comparison.paste(actual_pil, (pred_pil.width, 0))
     
     # Save
-    filename = f"prediction_comparison_{timestamp}.png"
+    filename = f"data/predictions/prediction_comparison_{timestamp}.png"
     comparison.save(filename)
+    return filename
+
+def create_animated_comparison(predicted_frames, actual_frames, timestamp):
+    """
+    Create an animated GIF showing predicted vs actual frames.
+    
+    Args:
+        predicted_frames: List of predicted image arrays
+        actual_frames: List of actual image arrays
+        timestamp: Timestamp for filename
+    """
+    comparison_frames = []
+    
+    for pred, actual in zip(predicted_frames, actual_frames):
+        # Convert to uint8
+        pred_img = (pred * 255).astype(np.uint8)
+        actual_img = (actual * 255).astype(np.uint8)
+        
+        # Create side-by-side comparison
+        pred_pil = Image.fromarray(pred_img)
+        actual_pil = Image.fromarray(actual_img)
+        
+        # Create a wider image to hold both
+        comparison = Image.new('RGB', (pred_pil.width * 2, pred_pil.height))
+        comparison.paste(pred_pil, (0, 0))
+        comparison.paste(actual_pil, (pred_pil.width, 0))
+        
+        comparison_frames.append(comparison)
+    
+    # Save as animated GIF
+    filename = f"data/predictions/prediction_animation_{timestamp}.gif"
+    comparison_frames[0].save(
+        filename,
+        save_all=True,
+        append_images=comparison_frames[1:],
+        duration=500,  # 500ms per frame
+        loop=0  # Loop forever
+    )
     return filename
 
 def continuous_learning():
     """
-    Continuously predict the next radar image and update the model.
+    Continuously predict the next 5 radar images every 5 minutes.
     
-    This script:
-    1. Waits for enough images to make a prediction
-    2. Predicts the next image
-    3. Waits 5 minutes for the actual image
-    4. Compares prediction with actual
-    5. Updates the model weights
-    6. Repeats
+    This creates a rolling prediction window:
+    - Every 5 minutes: Make new 5-frame prediction
+    - Track multiple predictions in flight
+    - When actual data arrives, compare and update model
+    
+    At any time, there are 5 live predictions being tracked.
     """
     print("=" * 70)
-    print("Radar Prediction - Continuous Learning")
+    print("Radar Prediction - Continuous Learning (Rolling 5-Frame)")
     print("=" * 70)
     print()
     
     # Initialize
-    data_manager = RadarDataManager()
+    data_manager = RadarDataManager(data_dir="data/radar_images")
     model = RadarPredictionModel()
     
     # Try to load existing model
@@ -94,13 +131,14 @@ def continuous_learning():
     
     print()
     print("Model loaded and ready.")
-    print("Waiting for radar images to make predictions...")
+    print("Making predictions every 5 minutes...")
+    print("Each prediction covers next 25 minutes (5 frames)")
     print("Press Ctrl+C to stop")
     print()
     print("-" * 70)
     
     prediction_count = 0
-    last_prediction_time = None
+    pending_predictions = []  # List of (timestamp, predicted_frames) tuples
     
     try:
         while True:
@@ -113,78 +151,132 @@ def continuous_learning():
                 time.sleep(60)  # Check every minute
                 continue
             
-            # Make prediction
+            # Make 5 predictions recursively
             timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"\n[{timestamp_str}] Making prediction #{prediction_count + 1}...")
+            print(f"\n[{timestamp_str}] Making 5-frame prediction #{prediction_count + 1}...")
             
-            prediction = model.predict(sequence)
             prediction_timestamp = int(time.time())
+            predicted_frames = []
+            current_sequence = sequence.copy()
             
-            # Save the prediction
-            pred_filename = f"predicted_{prediction_timestamp}.png"
-            pred_img = (prediction * 255).astype(np.uint8)
-            Image.fromarray(pred_img).save(pred_filename)
-            print(f"  Prediction saved: {pred_filename}")
+            for frame_num in range(5):
+                # Predict next frame
+                prediction = model.predict(current_sequence)
+                predicted_frames.append(prediction)
+                
+                # Update sequence for next prediction: remove oldest, add prediction
+                new_frame = np.expand_dims(prediction, axis=0)  # (1, 512, 512, 3)
+                new_frame = np.expand_dims(new_frame, axis=1)   # (1, 1, 512, 512, 3)
+                current_sequence = np.concatenate([current_sequence[:, 1:, :, :, :], new_frame], axis=1)
             
-            # Wait 5 minutes for the actual image to be collected
-            print("  Waiting 5 minutes for actual image...")
-            time.sleep(5 * 60)
+            # Save individual frames
+            for frame_num, pred_frame in enumerate(predicted_frames):
+                pred_filename = f"data/predictions/predicted_{prediction_timestamp}_frame{frame_num+1}.png"
+                pred_img = (pred_frame * 255).astype(np.uint8)
+                Image.fromarray(pred_img).save(pred_filename)
             
-            # Get the actual image that should have been collected
-            images = data_manager.get_all_radar_images()
-            if len(images) == 0:
-                print("  Warning: No actual image found!")
-                continue
+            # Create prediction-only animated GIF
+            prediction_frames_pil = []
+            for pred_frame in predicted_frames:
+                pred_img = (pred_frame * 255).astype(np.uint8)
+                prediction_frames_pil.append(Image.fromarray(pred_img))
             
-            # Find the actual image closest to our prediction time + 5 minutes
-            target_time = prediction_timestamp + 5 * 60
-            actual_image = min(images, key=lambda x: abs(x[0] - target_time))
-            
-            # Load the actual image
-            actual = data_manager.load_image(actual_image[1])
-            
-            # Calculate metrics
-            metrics = calculate_image_metrics(prediction, actual)
-            
-            timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"\n[{timestamp_str}] Prediction evaluation:")
-            print(f"  MSE: {metrics['mse']:.6f}")
-            print(f"  MAE: {metrics['mae']:.6f}")
-            print(f"  PSNR: {metrics['psnr']:.2f} dB")
-            
-            # Save metrics to JSON file for web viewer
-            import json
-            metrics_file = f"metrics_{prediction_timestamp}.json"
-            with open(metrics_file, 'w') as f:
-                json.dump(metrics, f, indent=2)
-            
-            # Save comparison image
-            comparison_file = save_prediction_comparison(
-                prediction, actual, prediction_timestamp
+            pred_only_filename = f"data/predictions/prediction_only_{prediction_timestamp}.gif"
+            prediction_frames_pil[0].save(
+                pred_only_filename,
+                save_all=True,
+                append_images=prediction_frames_pil[1:],
+                duration=500,
+                loop=0
             )
-            print(f"  Comparison saved: {comparison_file}")
             
-            # Update the model with this new data
-            print("  Updating model weights...")
+            print(f"  All 5 frames predicted and saved")
+            print(f"  Prediction animation: {pred_only_filename}")
             
-            # Get a fresh sequence including the new actual image
-            new_sequence = data_manager.get_latest_sequence()
-            if new_sequence is not None:
-                # The target is the image right after this sequence
-                target = np.expand_dims(actual, axis=0)  # Add batch dimension
+            # Add to pending predictions
+            pending_predictions.append((prediction_timestamp, predicted_frames))
+            
+            # Check if any predictions are ready to be evaluated (25 minutes old)
+            current_time = int(time.time())
+            ready_predictions = [(ts, frames) for ts, frames in pending_predictions 
+                                if current_time >= ts + 25 * 60]
+            
+            # Evaluate ready predictions
+            for pred_timestamp, pred_frames in ready_predictions:
+                print(f"\n  Evaluating prediction from {datetime.fromtimestamp(pred_timestamp).strftime('%H:%M:%S')}...")
                 
-                # Train on this single example (online learning)
-                loss = model.train_on_batch(new_sequence, target)
-                print(f"  Model updated - Loss: {loss:.6f}")
+                # Get actual images
+                images = data_manager.get_all_radar_images()
+                if len(images) == 0:
+                    continue
                 
-                # Save updated model periodically
-                if (prediction_count + 1) % 10 == 0:
-                    model.save('radar_model.keras')
-                    print("  Model saved to disk")
+                actual_frames = []
+                frame_metrics = []
+                
+                for frame_num in range(5):
+                    # Find actual image for this frame
+                    target_time = pred_timestamp + (frame_num + 1) * 5 * 60
+                    actual_image = min(images, key=lambda x: abs(x[0] - target_time))
+                    
+                    # Load the actual image
+                    actual = data_manager.load_image(actual_image[1])
+                    actual_frames.append(actual)
+                    
+                    # Calculate metrics
+                    metrics = calculate_image_metrics(pred_frames[frame_num], actual)
+                    frame_metrics.append(metrics)
+                
+                # Calculate averages
+                avg_mse = sum(m['mse'] for m in frame_metrics) / len(frame_metrics)
+                avg_mae = sum(m['mae'] for m in frame_metrics) / len(frame_metrics)
+                avg_psnr = sum(m['psnr'] for m in frame_metrics) / len(frame_metrics)
+                
+                print(f"  Avg MSE: {avg_mse:.6f}, MAE: {avg_mae:.6f}, PSNR: {avg_psnr:.2f} dB")
+                
+                # Save metrics
+                import json
+                all_metrics = {
+                    'frames': frame_metrics,
+                    'average': {
+                        'mse': avg_mse,
+                        'mae': avg_mae,
+                        'psnr': avg_psnr
+                    }
+                }
+                metrics_file = f"data/predictions/metrics_{pred_timestamp}.json"
+                with open(metrics_file, 'w') as f:
+                    json.dump(all_metrics, f, indent=2)
+                
+                # Create comparison animation
+                animation_file = create_animated_comparison(
+                    pred_frames, actual_frames, pred_timestamp
+                )
+                
+                # Create static comparison for backward compatibility
+                comparison_file = save_prediction_comparison(
+                    pred_frames[0], actual_frames[0], pred_timestamp
+                )
+                
+                print(f"  Comparison saved: {animation_file}")
+                
+                # Update model with first frame
+                new_sequence = data_manager.get_latest_sequence()
+                if new_sequence is not None:
+                    target = np.expand_dims(actual_frames[0], axis=0)
+                    result = model.train_on_batch(new_sequence, target)
+                    loss_value = result[0] if isinstance(result, list) else result
+                    print(f"  Model updated - Loss: {loss_value:.6f}")
+                
+                # Remove from pending
+                pending_predictions.remove((pred_timestamp, pred_frames))
             
             prediction_count += 1
-            print(f"\n  Total predictions made: {prediction_count}")
+            print(f"\n  Total predictions: {prediction_count}")
+            print(f"  Pending evaluations: {len(pending_predictions)}")
             print("-" * 70)
+            
+            # Wait 5 minutes before next prediction
+            time.sleep(5 * 60)
             
     except KeyboardInterrupt:
         print("\n")
@@ -193,7 +285,7 @@ def continuous_learning():
         
         # Save the final model
         model.save('radar_model.keras')
-        print(f"Model saved with {prediction_count} predictions")
+        print(f"Model saved with {prediction_count} prediction cycles")
         print("=" * 70)
 
 

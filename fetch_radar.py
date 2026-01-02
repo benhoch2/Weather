@@ -22,7 +22,7 @@ def fetch_radar_last_frame():
         
         # Get current epoch timestamp for filename
         current_timestamp = int(time.time())
-        filename = f"radar_{current_timestamp}.png"
+        filename = f"data/radar_images/radar_{current_timestamp}.png"
         
         # Open and process the image
         img = Image.open(BytesIO(response.content))

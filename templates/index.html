@@ -243,6 +243,15 @@
             </div>
         </div>
 
+        <!-- Current Prediction Section -->
+        <div id="current-prediction-section" style="display: none;">
+            <div style="background: white; border-radius: 15px; padding: 30px; box-shadow: 0 10px 30px rgba(0,0,0,0.3); margin-bottom: 30px;">
+                <h2 style="color: #667eea; margin-bottom: 20px;">🔮 Current Prediction - Next 25 Minutes</h2>
+                <div id="current-prediction-content"></div>
+            </div>
+        </div>
+
+        <h2 style="color: white; margin: 30px 0 20px 0;">📊 Prediction History</h2>
         <div class="predictions-grid" id="predictions-grid">
             <div class="loading">Loading predictions...</div>
         </div>
@@ -274,19 +283,67 @@
             }
         }
 
+        async function loadCurrentPrediction() {
+            try {
+                const response = await fetch('/api/current_prediction');
+                const current = await response.json();
+                
+                const section = document.getElementById('current-prediction-section');
+                const content = document.getElementById('current-prediction-content');
+                
+                if (current && current.is_active) {
+                    section.style.display = 'block';
+                    
+                    const timeInfo = current.minutes_remaining > 0 
+                        ? `⏱️ ${current.minutes_remaining} minutes until evaluation`
+                        : '⏱️ Evaluation in progress...';
+                    
+                    content.innerHTML = `
+                        <div style="display: flex; align-items: center; gap: 30px;">
+                            <div style="flex: 0 0 auto;">
+                                <img src="/images/${current.prediction_file}" 
+                                     style="max-width: 400px; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.2); cursor: pointer;"
+                                     onclick="openModal('/images/${current.prediction_file}')"
+                                     alt="Current prediction">
+                            </div>
+                            <div style="flex: 1;">
+                                <p style="font-size: 1.2em; color: #333; margin-bottom: 15px;">
+                                    <strong>Predicted at:</strong> ${current.datetime}
+                                </p>
+                                <p style="font-size: 1.5em; color: #667eea; font-weight: bold;">
+                                    ${timeInfo}
+                                </p>
+                                <p style="color: #666; margin-top: 15px;">
+                                    This animation shows the predicted radar for the next 25 minutes (5 frames).
+                                    The model predicts how weather patterns will evolve based on the last hour of data.
+                                </p>
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    section.style.display = 'none';
+                }
+            } catch (error) {
+                console.error('Error loading current prediction:', error);
+            }
+        }
+
         async function loadPredictions() {
             try {
-                const response = await fetch('/api/predictions');
+                // Load only last 20 predictions for faster loading
+                const response = await fetch('/api/predictions?limit=20');
                 const predictions = await response.json();
                 
                 const grid = document.getElementById('predictions-grid');
                 
-                if (predictions.length === 0) {
+                // Filter to show only completed predictions (with comparisons)
+                const completed = predictions.filter(p => p.comparison_file);
+                
+                if (completed.length === 0) {
                     grid.innerHTML = `
                         <div class="no-predictions">
-                            <h2>No Predictions Yet</h2>
-                            <p>Start the prediction system with <code>predict_continuous.py</code></p>
-                            <p style="margin-top: 10px;">Predictions will appear here as they are made.</p>
+                            <h2>No Completed Predictions Yet</h2>
+                            <p>Predictions will appear here after evaluation (25 minutes after prediction time).</p>
                         </div>
                     `;
                     return;
@@ -294,37 +351,69 @@
                 
                 grid.innerHTML = '';
                 
-                predictions.forEach(pred => {
+                // Add "Load More" button if there might be more predictions
+                if (completed.length === 20) {
+                    const loadMoreInfo = document.createElement('div');
+                    loadMoreInfo.style.cssText = 'grid-column: 1 / -1; text-align: center; padding: 20px; background: white; border-radius: 15px;';
+                    loadMoreInfo.innerHTML = '<p style="color: #667eea; font-size: 1.1em;">Showing last 20 predictions for faster loading</p>';
+                    grid.appendChild(loadMoreInfo);
+                }
+                
+                completed.forEach(pred => {
                     const card = document.createElement('div');
                     card.className = 'prediction-card';
                     
+                    // Use comparison animation
+                    const imageFile = pred.comparison_file;
+                    
                     let metricsHTML = '';
                     if (pred.metrics) {
-                        metricsHTML = `
-                            <div class="metrics">
-                                <div class="metric">
-                                    <div class="metric-value">${pred.metrics.mse.toFixed(6)}</div>
-                                    <div class="metric-label">MSE</div>
+                        // Check if we have multi-frame metrics
+                        if (pred.metrics.average) {
+                            metricsHTML = `
+                                <div class="metrics">
+                                    <div class="metric">
+                                        <div class="metric-value">${pred.metrics.average.mse.toFixed(6)}</div>
+                                        <div class="metric-label">Avg MSE</div>
+                                    </div>
+                                    <div class="metric">
+                                        <div class="metric-value">${pred.metrics.average.mae.toFixed(6)}</div>
+                                        <div class="metric-label">Avg MAE</div>
+                                    </div>
+                                    <div class="metric">
+                                        <div class="metric-value">${pred.metrics.average.psnr.toFixed(2)}</div>
+                                        <div class="metric-label">Avg PSNR (dB)</div>
+                                    </div>
                                 </div>
-                                <div class="metric">
-                                    <div class="metric-value">${pred.metrics.mae.toFixed(6)}</div>
-                                    <div class="metric-label">MAE</div>
+                            `;
+                        } else {
+                            metricsHTML = `
+                                <div class="metrics">
+                                    <div class="metric">
+                                        <div class="metric-value">${pred.metrics.mse.toFixed(6)}</div>
+                                        <div class="metric-label">MSE</div>
+                                    </div>
+                                    <div class="metric">
+                                        <div class="metric-value">${pred.metrics.mae.toFixed(6)}</div>
+                                        <div class="metric-label">MAE</div>
+                                    </div>
+                                    <div class="metric">
+                                        <div class="metric-value">${pred.metrics.psnr.toFixed(2)}</div>
+                                        <div class="metric-label">PSNR (dB)</div>
+                                    </div>
                                 </div>
-                                <div class="metric">
-                                    <div class="metric-value">${pred.metrics.psnr.toFixed(2)}</div>
-                                    <div class="metric-label">PSNR (dB)</div>
-                                </div>
-                            </div>
-                        `;
+                            `;
+                        }
                     }
                     
                     card.innerHTML = `
-                        <img src="/images/${pred.comparison_image}" 
+                        <img src="/images/${imageFile}" 
                              alt="Prediction comparison" 
                              class="prediction-image"
-                             onclick="openModal('/images/${pred.comparison_image}')">
+                             onclick="openModal('/images/${imageFile}')">
                         <div class="prediction-info">
                             <div class="prediction-time">📅 ${pred.datetime}</div>
+                            <div style="font-size: 0.85em; color: #888; margin-top: 5px;">5-Frame Comparison</div>
                             ${metricsHTML}
                         </div>
                     `;
@@ -355,6 +444,7 @@
 
         async function loadData() {
             await loadStatistics();
+            await loadCurrentPrediction();
             await loadPredictions();
         }
 
