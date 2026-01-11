@@ -71,6 +71,82 @@
             letter-spacing: 1px;
         }
 
+        .control-panel {
+            background: white;
+            border-radius: 15px;
+            padding: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            margin-bottom: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .control-buttons {
+            display: flex;
+            gap: 15px;
+        }
+
+        .control-button {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .start-button {
+            background: #4CAF50;
+            color: white;
+        }
+
+        .start-button:hover:not(:disabled) {
+            background: #45a049;
+        }
+
+        .stop-button {
+            background: #f44336;
+            color: white;
+        }
+
+        .stop-button:hover:not(:disabled) {
+            background: #da190b;
+        }
+
+        .control-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: bold;
+        }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        .status-running {
+            background: #4CAF50;
+        }
+
+        .status-stopped {
+            background: #999;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
         .predictions-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
@@ -224,6 +300,18 @@
             <p class="subtitle">Machine Learning Weather Forecasting - Real-time Predictions vs Reality</p>
         </header>
 
+        <!-- Prediction Control Panel -->
+        <div class="control-panel">
+            <div class="control-buttons">
+                <button class="control-button start-button" id="start-btn" onclick="startPredictions()">▶ Start Predictions</button>
+                <button class="control-button stop-button" id="stop-btn" onclick="stopPredictions()">⏹ Stop Predictions</button>
+            </div>
+            <div class="status-indicator">
+                <span class="status-dot status-stopped" id="status-dot"></span>
+                <span id="status-text">Status: Stopped</span>
+            </div>
+        </div>
+
         <div class="statistics" id="statistics">
             <div class="stat-card">
                 <div class="stat-value" id="total-predictions">-</div>
@@ -293,12 +381,10 @@
                 const section = document.getElementById('current-prediction-section');
                 const content = document.getElementById('current-prediction-content');
                 
-                if (current && current.is_active) {
+                if (current && current.prediction_file) {
                     section.style.display = 'block';
                     
-                    const timeInfo = current.minutes_remaining > 0 
-                        ? `⏱️ ${current.minutes_remaining} minutes until evaluation`
-                        : '⏱️ Evaluation in progress...';
+                    const timeInfo = `📅 Made ${current.minutes_ago} minute(s) ago`;
                     
                     content.innerHTML = `
                         <div style="display: flex; align-items: center; gap: 30px;">
@@ -306,18 +392,21 @@
                                 <img src="/images/${current.prediction_file}" 
                                      style="max-width: 400px; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.2); cursor: pointer;"
                                      onclick="openModal('/images/${current.prediction_file}')"
-                                     alt="Current prediction">
+                                     alt="Latest prediction">
                             </div>
                             <div style="flex: 1;">
                                 <p style="font-size: 1.2em; color: #333; margin-bottom: 15px;">
-                                    <strong>Predicted at:</strong> ${current.datetime}
+                                    <strong>Latest Prediction:</strong> ${current.datetime}
                                 </p>
-                                <p style="font-size: 1.5em; color: #667eea; font-weight: bold;">
+                                <p style="font-size: 1.3em; color: #667eea; font-weight: bold;">
                                     ${timeInfo}
                                 </p>
                                 <p style="color: #666; margin-top: 15px;">
                                     This animation shows the predicted radar for the next 25 minutes (5 frames).
                                     The model predicts how weather patterns will evolve based on the last hour of data.
+                                </p>
+                                <p style="color: #999; margin-top: 10px; font-size: 0.9em;">
+                                    ⏳ Comparison with actual data will appear below in ~${25 - current.minutes_ago} minutes
                                 </p>
                             </div>
                         </div>
@@ -478,13 +567,103 @@
             await loadStatistics();
             await loadCurrentPrediction();
             await loadPredictions();
+            await updatePredictionStatus();
+        }
+
+        async function updatePredictionStatus() {
+            try {
+                const response = await fetch('/api/prediction_control/status');
+                const data = await response.json();
+                
+                const statusDot = document.getElementById('status-dot');
+                const statusText = document.getElementById('status-text');
+                const startBtn = document.getElementById('start-btn');
+                const stopBtn = document.getElementById('stop-btn');
+                
+                if (data.running) {
+                    statusDot.className = 'status-dot status-running';
+                    statusText.textContent = `Status: Running (PID: ${data.pid})`;
+                    startBtn.disabled = true;
+                    stopBtn.disabled = false;
+                } else {
+                    statusDot.className = 'status-dot status-stopped';
+                    statusText.textContent = 'Status: Stopped';
+                    startBtn.disabled = false;
+                    stopBtn.disabled = true;
+                }
+            } catch (error) {
+                console.error('Error checking status:', error);
+            }
+        }
+
+        async function startPredictions() {
+            try {
+                const response = await fetch('/api/prediction_control/start', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (data.status === 'started' || data.status === 'already_running') {
+                    await updatePredictionStatus();
+                    if (data.status === 'started') {
+                        alert('Prediction process started successfully!');
+                    } else {
+                        alert('Prediction process is already running.');
+                    }
+                } else if (data.status === 'error') {
+                    alert('Error starting predictions: ' + data.message);
+                }
+            } catch (error) {
+                console.error('Error starting predictions:', error);
+                alert('Failed to start predictions: ' + error.message);
+            }
+        }
+
+        async function stopPredictions() {
+            if (!confirm('Are you sure you want to stop the prediction process?')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/prediction_control/stop', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (data.status === 'stopped' || data.status === 'force_stopped' || data.status === 'not_running') {
+                    await updatePredictionStatus();
+                    if (data.status === 'stopped') {
+                        alert('Prediction process stopped successfully.');
+                    } else if (data.status === 'force_stopped') {
+                        alert('Prediction process was force stopped.');
+                    } else {
+                        alert('Prediction process was not running.');
+                    }
+                } else if (data.status === 'error') {
+                    alert('Error stopping predictions: ' + data.message);
+                }
+            } catch (error) {
+                console.error('Error stopping predictions:', error);
+                alert('Failed to stop predictions: ' + error.message);
+            }
         }
 
         // Load data on page load
         loadData();
 
-        // Auto-refresh every 30 seconds
+        // Auto-refresh data every 30 seconds
         setInterval(loadData, 30000);
+        
+        // Update prediction status more frequently (every 5 seconds)
+        setInterval(updatePredictionStatus, 5000);
     </script>
 </body>
 </html>

@@ -3,8 +3,15 @@ from pathlib import Path
 import json
 from datetime import datetime
 import re
+import subprocess
+import os
+import signal
 
 app = Flask(__name__)
+
+# Global process tracking
+prediction_process = None
+prediction_running = False
 
 class PredictionViewer:
     """
@@ -35,26 +42,30 @@ class PredictionViewer:
                 timestamp = int(match.group(1))
                 current_time = int(datetime.now().timestamp())
                 
-                # Check if evaluation is complete (comparison file exists)
+                # Check if evaluation is complete (comparison file exists AND metrics don't have pending flag)
                 comparison_file = self.data_dir / f"prediction_animation_{timestamp}.gif"
-                is_evaluated = comparison_file.exists()
+                metrics = self.load_metrics(timestamp)
+                
+                # Only include if comparison is ready AND not pending (no grey placeholders)
+                is_evaluated = comparison_file.exists() and metrics and not metrics.get('pending', False)
                 
                 # Calculate time remaining until evaluation (25 minutes from prediction)
                 eval_time = timestamp + 25 * 60
                 time_remaining = max(0, eval_time - current_time)
                 minutes_remaining = time_remaining // 60
                 
-                prediction_info = {
-                    'timestamp': timestamp,
-                    'datetime': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
-                    'prediction_file': file.name,
-                    'is_active': not is_evaluated and time_remaining > 0,
-                    'minutes_remaining': minutes_remaining if not is_evaluated else 0,
-                    'comparison_file': comparison_file.name if is_evaluated else None,
-                    'metrics': self.load_metrics(timestamp) if is_evaluated else None
-                }
-                
-                predictions.append(prediction_info)
+                # Only include predictions where comparison is ready (no grey placeholders)
+                if is_evaluated:
+                    prediction_info = {
+                        'timestamp': timestamp,
+                        'datetime': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
+                        'prediction_file': file.name,
+                        'is_active': False,
+                        'minutes_remaining': 0,
+                        'comparison_file': comparison_file.name,
+                        'metrics': metrics
+                    }
+                    predictions.append(prediction_info)
             except (ValueError, IndexError):
                 continue
         
@@ -71,6 +82,11 @@ class PredictionViewer:
                 if any(p['timestamp'] == timestamp for p in predictions):
                     continue
                 
+                # Check metrics to ensure it's not pending
+                metrics = self.load_metrics(timestamp)
+                if metrics and metrics.get('pending', False):
+                    continue  # Skip pending predictions with grey placeholders
+                
                 prediction_info = {
                     'timestamp': timestamp,
                     'datetime': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
@@ -78,7 +94,7 @@ class PredictionViewer:
                     'is_active': False,
                     'minutes_remaining': 0,
                     'comparison_file': file.name,
-                    'metrics': self.load_metrics(timestamp)
+                    'metrics': metrics
                 }
                 
                 predictions.append(prediction_info)
@@ -117,13 +133,28 @@ class PredictionViewer:
         
         return predictions
     
-    def get_latest_active_prediction(self):
+    def get_latest_prediction_only(self):
         """
-        Get the most recent active prediction (not yet evaluated).
+        Get the most recent prediction (prediction-only GIF, not comparison).
+        This shows what the model just predicted, without waiting for actual data.
         """
-        predictions = self.get_all_predictions()
-        active = [p for p in predictions if p['is_active']]
-        return active[0] if active else None
+        # Find the most recent prediction_only file
+        prediction_files = sorted(self.data_dir.glob("prediction_only_*.gif"), reverse=True)
+        if not prediction_files:
+            return None
+        
+        latest = prediction_files[0]
+        match = re.search(r'prediction_only_(\d+)\.gif', latest.name)
+        if not match:
+            return None
+        
+        timestamp = int(match.group(1))
+        return {
+            'timestamp': timestamp,
+            'datetime': datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S'),
+            'prediction_file': latest.name,
+            'minutes_ago': int((datetime.now().timestamp() - timestamp) / 60)
+        }
     
     def load_metrics(self, timestamp):
         """
@@ -196,8 +227,8 @@ def get_predictions():
 
 @app.route('/api/current_prediction')
 def get_current_prediction():
-    """API endpoint to get the current active prediction."""
-    current = viewer.get_latest_active_prediction()
+    """API endpoint to get the latest prediction-only (most recent prediction without comparison)."""
+    current = viewer.get_latest_prediction_only()
     return jsonify(current if current else {})
 
 @app.route('/api/statistics')
@@ -213,6 +244,72 @@ def serve_image(filename):
     if file_path.exists():
         return send_file(file_path, mimetype='image/png')
     return "Image not found", 404
+
+@app.route('/api/prediction_control/start', methods=['POST'])
+def start_predictions():
+    """Start the prediction process."""
+    global prediction_process, prediction_running
+    
+    if prediction_running and prediction_process and prediction_process.poll() is None:
+        return jsonify({'status': 'already_running', 'message': 'Predictions are already running'})
+    
+    try:
+        # Start persistent runner with auto-restart capability
+        prediction_process = subprocess.Popen(
+            ['python', 'run_predictions_persistent.py'],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+        )
+        prediction_running = True
+        return jsonify({'status': 'started', 'message': 'Prediction process started with auto-restart', 'pid': prediction_process.pid})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/prediction_control/stop', methods=['POST'])
+def stop_predictions():
+    """Stop the prediction process."""
+    global prediction_process, prediction_running
+    
+    if not prediction_running or not prediction_process:
+        return jsonify({'status': 'not_running', 'message': 'Predictions are not running'})
+    
+    try:
+        if os.name == 'nt':
+            # Windows: Send CTRL_BREAK_EVENT
+            os.kill(prediction_process.pid, signal.CTRL_BREAK_EVENT)
+        else:
+            # Unix: Send SIGTERM
+            prediction_process.terminate()
+        
+        prediction_process.wait(timeout=5)
+        prediction_running = False
+        prediction_process = None
+        return jsonify({'status': 'stopped', 'message': 'Prediction process stopped'})
+    except subprocess.TimeoutExpired:
+        # Force kill if it doesn't stop gracefully
+        prediction_process.kill()
+        prediction_running = False
+        prediction_process = None
+        return jsonify({'status': 'force_stopped', 'message': 'Prediction process force stopped'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/prediction_control/status')
+def prediction_status():
+    """Get the status of the prediction process."""
+    global prediction_process, prediction_running
+    
+    # Check if process is actually running
+    if prediction_process and prediction_process.poll() is not None:
+        prediction_running = False
+        prediction_process = None
+    
+    return jsonify({
+        'running': prediction_running,
+        'pid': prediction_process.pid if prediction_process else None
+    })
 
 if __name__ == '__main__':
     print("=" * 70)

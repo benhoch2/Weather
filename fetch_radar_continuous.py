@@ -3,6 +3,7 @@ from PIL import Image
 from io import BytesIO
 import time
 from datetime import datetime
+from pathlib import Path
 
 def fetch_radar_image():
     """
@@ -39,6 +40,9 @@ def fetch_radar_image():
         img.save(filename)
         print(f"  ✓ Saved as: {filename}")
         
+        # Clean up old images - keep only last 12
+        cleanup_old_images()
+        
         return filename
             
     except requests.exceptions.RequestException as e:
@@ -47,6 +51,32 @@ def fetch_radar_image():
     except Exception as e:
         print(f"  ✗ Error processing image: {e}")
         return None
+
+def cleanup_old_images():
+    """
+    Keep only the last 12 radar images, delete older ones.
+    This ensures we always have a complete sequence ready for predictions.
+    """
+    try:
+        images_dir = Path("data/radar_images")
+        if not images_dir.exists():
+            return
+        
+        # Get all radar images sorted by timestamp (newest first)
+        radar_images = sorted(
+            images_dir.glob("radar_*.png"),
+            key=lambda p: int(p.stem.split('_')[1]),
+            reverse=True
+        )
+        
+        # Keep only the 12 most recent, delete the rest
+        if len(radar_images) > 12:
+            images_to_delete = radar_images[12:]
+            for img_path in images_to_delete:
+                img_path.unlink()
+            print(f"  [CLEANUP] Cleaned up {len(images_to_delete)} old image(s)")
+    except Exception as e:
+        print(f"  [WARNING] Error during cleanup: {e}")
 
 def main():
     """
