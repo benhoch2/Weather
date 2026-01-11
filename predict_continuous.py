@@ -363,7 +363,7 @@ def continuous_learning():
                         pred_frames[0], actual_frames[0], pred_timestamp
                     )
                     
-                    print(f"  ✓ Comparison updated with actual data: {animation_file}")
+                    print(f"  [SUCCESS] Comparison updated with actual data: {animation_file}")
                     
                     # Update model with first frame
                     new_sequence = data_manager.get_latest_sequence()
