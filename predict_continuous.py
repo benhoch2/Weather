@@ -181,6 +181,13 @@ def continuous_learning():
     print("Radar Prediction - Continuous Learning (Rolling 5-Frame)")
     print("=" * 70)
     print()
+
+    run_start_timestamp = int(time.time())
+    # Allow frames captured up to 1 hour before this process started.
+    # This lets the fetcher warm up before the predictor is launched without
+    # treating those recent frames as stale. Months-old frames are still excluded.
+    fresh_cutoff = run_start_timestamp - 3600
+    run_start_str = datetime.fromtimestamp(run_start_timestamp).strftime("%Y-%m-%d %H:%M:%S")
     
     # Initialize
     data_manager = RadarDataManager(data_dir="data/radar_images")
@@ -202,6 +209,7 @@ def continuous_learning():
     print("Model loaded and ready.")
     print("Making predictions every 5 minutes...")
     print("Each prediction covers next 25 minutes (5 frames)")
+    print(f"Waiting for 12 new frames captured after: {run_start_str}")
     print("Press Ctrl+C to stop")
     print()
     print("-" * 70)
@@ -212,12 +220,16 @@ def continuous_learning():
     try:
         while True:
             try:
-                # Get the latest sequence
-                sequence = data_manager.get_latest_sequence()
+                # Only predict once this run has accumulated a full fresh window.
+                sequence = data_manager.get_latest_sequence(min_timestamp=fresh_cutoff)
                 
                 if sequence is None:
                     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"[{timestamp_str}] Waiting for enough images (need 12)...")
+                    fresh_count = data_manager.count_radar_images_since(fresh_cutoff)
+                    print(
+                        f"[{timestamp_str}] Waiting for 12 new images from this run "
+                        f"({fresh_count}/12 collected since {run_start_str})..."
+                    )
                     time.sleep(60)  # Check every minute
                     continue
                 

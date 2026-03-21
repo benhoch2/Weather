@@ -4,6 +4,9 @@ from io import BytesIO
 import time
 from datetime import datetime
 from pathlib import Path
+import os
+
+DEFAULT_MAX_STORED_IMAGES = 0
 
 def fetch_radar_image():
     """
@@ -54,12 +57,19 @@ def fetch_radar_image():
 
 def cleanup_old_images():
     """
-    Keep only the last 12 radar images, delete older ones.
-    This ensures we always have a complete sequence ready for predictions.
+    Optionally prune old radar images when a retention cap is configured.
+
+    By default, no images are deleted so the fetcher can build a real
+    training corpus over time. Set WEATHER_RADAR_MAX_IMAGES to a positive
+    integer to enable automatic pruning.
     """
     try:
         images_dir = Path("data/radar_images")
         if not images_dir.exists():
+            return
+
+        max_images = int(os.environ.get("WEATHER_RADAR_MAX_IMAGES", DEFAULT_MAX_STORED_IMAGES))
+        if max_images <= 0:
             return
         
         # Get all radar images sorted by timestamp (newest first)
@@ -69,12 +79,12 @@ def cleanup_old_images():
             reverse=True
         )
         
-        # Keep only the 12 most recent, delete the rest
-        if len(radar_images) > 12:
-            images_to_delete = radar_images[12:]
+        # Keep only the configured number of recent images, delete the rest
+        if len(radar_images) > max_images:
+            images_to_delete = radar_images[max_images:]
             for img_path in images_to_delete:
                 img_path.unlink()
-            print(f"  [CLEANUP] Cleaned up {len(images_to_delete)} old image(s)")
+            print(f"  [CLEANUP] Retained latest {max_images} images, removed {len(images_to_delete)} old image(s)")
     except Exception as e:
         print(f"  [WARNING] Error during cleanup: {e}")
 

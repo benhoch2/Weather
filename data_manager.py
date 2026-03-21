@@ -42,6 +42,24 @@ class RadarDataManager:
         # Sort by timestamp
         images.sort(key=lambda x: x[0])
         return images
+
+    def get_radar_images_since(self, min_timestamp):
+        """
+        Get radar images captured at or after a given timestamp.
+
+        Args:
+            min_timestamp: Minimum Unix timestamp to include
+
+        Returns:
+            Filtered list of (timestamp, filepath) tuples
+        """
+        return [image for image in self.get_all_radar_images() if image[0] >= min_timestamp]
+
+    def count_radar_images_since(self, min_timestamp):
+        """
+        Count radar images captured at or after a given timestamp.
+        """
+        return len(self.get_radar_images_since(min_timestamp))
     
     def load_image(self, filepath, normalize=True):
         """
@@ -118,15 +136,22 @@ class RadarDataManager:
         
         return X, y
     
-    def get_latest_sequence(self):
+    def get_latest_sequence(self, min_timestamp=None):
         """
         Get the most recent sequence of images for prediction.
+
+        Args:
+            min_timestamp: Optional minimum Unix timestamp. When provided,
+                only images captured at or after this time are eligible.
         
         Returns:
             numpy array of shape (1, sequence_length, height, width, channels)
             or None if not enough images
         """
-        images = self.get_all_radar_images()
+        if min_timestamp is None:
+            images = self.get_all_radar_images()
+        else:
+            images = self.get_radar_images_since(min_timestamp)
         
         if len(images) < self.sequence_length:
             return None

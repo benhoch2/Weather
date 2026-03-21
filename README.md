@@ -39,6 +39,9 @@ python fetch_radar_continuous.py
 
 Keep this running to continuously collect radar images. The more images you collect, the better your model will be.
 
+By default the fetcher now keeps all collected radar images so you can build a larger training set over time.
+If you want automatic pruning, set `WEATHER_RADAR_MAX_IMAGES` to a positive integer before starting the fetcher.
+
 ### Step 2: Train Initial Model
 Once you have at least 13 images (recommended: 50+ images for better results):
 ```bash
@@ -81,7 +84,16 @@ Start the web interface to see all predictions and metrics in your browser:
 python web_viewer.py
 ```
 
-Then open your browser and go to: **http://localhost:5000**
+By default the viewer runs on **http://localhost:5050**.
+
+If you want a different port:
+```bash
+$env:WEATHER_RADAR_VIEWER_PORT=8080
+python web_viewer.py
+```
+
+The viewer can start and stop the prediction worker from the browser UI, but it does **not** start the radar fetcher.
+Keep `fetch_radar_continuous.py` running in a separate terminal if you want live incoming data.
 
 The web interface shows:
 - All prediction comparisons (predicted vs actual side-by-side)

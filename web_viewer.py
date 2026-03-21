@@ -6,12 +6,17 @@ import re
 import subprocess
 import os
 import signal
+import sys
+import time
 
 app = Flask(__name__)
+
+DEFAULT_PORT = 5050
 
 # Global process tracking
 prediction_process = None
 prediction_running = False
+prediction_start_time = None
 
 class PredictionViewer:
     """
@@ -248,21 +253,26 @@ def serve_image(filename):
 @app.route('/api/prediction_control/start', methods=['POST'])
 def start_predictions():
     """Start the prediction process."""
-    global prediction_process, prediction_running
+    global prediction_process, prediction_running, prediction_start_time
     
     if prediction_running and prediction_process and prediction_process.poll() is None:
         return jsonify({'status': 'already_running', 'message': 'Predictions are already running'})
     
     try:
-        # Start persistent runner with auto-restart capability
+        # Start persistent runner with auto-restart capability.
+        # Use sys.executable so the venv Python is always used, regardless of PATH.
+        # Do NOT pipe stdout/stderr: piping without a reader causes a pipe-buffer
+        # deadlock (run_predictions_persistent streams child output via print(),
+        # which would block once the ~64 KB Windows pipe buffer fills up).
+        # Output flows to the web_viewer.py terminal instead, which is useful
+        # for debugging and keeps the child alive.
         prediction_process = subprocess.Popen(
-            ['python', 'run_predictions_persistent.py'],
+            [sys.executable, 'run_predictions_persistent.py'],
             cwd=os.path.dirname(os.path.abspath(__file__)),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
         )
         prediction_running = True
+        prediction_start_time = int(time.time())
         return jsonify({'status': 'started', 'message': 'Prediction process started with auto-restart', 'pid': prediction_process.pid})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -270,7 +280,7 @@ def start_predictions():
 @app.route('/api/prediction_control/stop', methods=['POST'])
 def stop_predictions():
     """Stop the prediction process."""
-    global prediction_process, prediction_running
+    global prediction_process, prediction_running, prediction_start_time
     
     if not prediction_running or not prediction_process:
         return jsonify({'status': 'not_running', 'message': 'Predictions are not running'})
@@ -286,12 +296,14 @@ def stop_predictions():
         prediction_process.wait(timeout=5)
         prediction_running = False
         prediction_process = None
+        prediction_start_time = None
         return jsonify({'status': 'stopped', 'message': 'Prediction process stopped'})
     except subprocess.TimeoutExpired:
         # Force kill if it doesn't stop gracefully
         prediction_process.kill()
         prediction_running = False
         prediction_process = None
+        prediction_start_time = None
         return jsonify({'status': 'force_stopped', 'message': 'Prediction process force stopped'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -299,27 +311,80 @@ def stop_predictions():
 @app.route('/api/prediction_control/status')
 def prediction_status():
     """Get the status of the prediction process."""
-    global prediction_process, prediction_running
+    global prediction_process, prediction_running, prediction_start_time
     
     # Check if process is actually running
     if prediction_process and prediction_process.poll() is not None:
         prediction_running = False
         prediction_process = None
+        prediction_start_time = None
     
     return jsonify({
         'running': prediction_running,
         'pid': prediction_process.pid if prediction_process else None
     })
 
+@app.route('/api/readiness')
+def get_readiness():
+    """Return how many fresh radar frames have arrived since the predictor was started."""
+    global prediction_start_time, prediction_running, prediction_process
+
+    # Sync process state first
+    if prediction_process and prediction_process.poll() is not None:
+        prediction_running = False
+        prediction_process = None
+        prediction_start_time = None
+
+    if not prediction_running or prediction_start_time is None:
+        return jsonify({
+            'running': False,
+            'frames_since_start': 0,
+            'frames_needed': 12,
+            'ready': False,
+            'eta_minutes': None,
+            'started_at': None
+        })
+
+    radar_dir = Path('data/radar_images')
+    frames_since_start = 0
+    # Allow a 1-hour grace window before the predictor started so frames
+    # captured by the fetcher just before clicking Start Predictions also count.
+    # This still excludes frames that are hours/days/months old.
+    fresh_cutoff = prediction_start_time - 3600
+    if radar_dir.exists():
+        for f in radar_dir.glob('radar_*.png'):
+            try:
+                ts = int(f.stem.split('_')[1])
+                if ts >= fresh_cutoff:
+                    frames_since_start += 1
+            except (ValueError, IndexError):
+                continue
+
+    frames_needed = 12
+    ready = frames_since_start >= frames_needed
+    eta_minutes = 0 if ready else (frames_needed - frames_since_start) * 5
+
+    return jsonify({
+        'running': True,
+        'frames_since_start': frames_since_start,
+        'frames_needed': frames_needed,
+        'ready': ready,
+        'eta_minutes': eta_minutes,
+        'started_at': datetime.fromtimestamp(prediction_start_time).strftime('%Y-%m-%d %H:%M:%S')
+    })
+
 if __name__ == '__main__':
+    port = int(os.environ.get('WEATHER_RADAR_VIEWER_PORT', DEFAULT_PORT))
     print("=" * 70)
     print("Weather Radar Prediction Viewer")
     print("=" * 70)
     print()
     print("Starting web interface...")
-    print("Open your browser and go to: http://localhost:5000")
+    print(f"Open your browser and go to: http://localhost:{port}")
     print()
     print("Press Ctrl+C to stop the server")
     print("=" * 70)
     
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # use_reloader=False prevents the werkzeug file-watcher from killing the
+    # prediction subprocess reference stored in global variables on file changes.
+    app.run(debug=True, use_reloader=False, host='0.0.0.0', port=port)
