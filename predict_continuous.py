@@ -7,6 +7,7 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 import sys
 import gc
+import re
 import numpy as np
 from PIL import Image
 import time
@@ -253,7 +254,64 @@ def continuous_learning():
     
     prediction_count = 0
     train_count = 0  # Number of online learning updates since launch
-    pending_predictions = []  # List of prediction timestamps (frames stored on disk)
+
+    # Recover pending predictions from disk that weren't evaluated before a restart.
+    # Any metrics file with "pending": true whose predicted frames still exist on disk
+    # is re-queued so evaluation resumes without losing the prediction from history.
+    # Exception: if the prediction is already past its evaluation window AND actual
+    # frames are missing (stuck-radar gap), mark it skipped immediately rather than
+    # re-queuing it to fail again on every future restart.
+    pending_predictions = []
+    _predictions_dir = Path("data/predictions")
+    if _predictions_dir.exists():
+        # Pre-load available radar timestamps once for fast lookup
+        _available_ts = sorted(
+            int(re.search(r'radar_(\d+)\.png', p.name).group(1))
+            for p in Path("data/radar_images").glob("radar_*.png")
+            if re.search(r'radar_(\d+)\.png', p.name)
+        ) if Path("data/radar_images").exists() else []
+
+        for _mf in sorted(_predictions_dir.glob("metrics_*.json")):
+            try:
+                _data = json.loads(_mf.read_text())
+                if _data.get('pending'):
+                    _m = re.search(r'metrics_(\d+)\.json', _mf.name)
+                    if not _m:
+                        continue
+                    _ts = int(_m.group(1))
+                    # Skip if predicted frames no longer exist
+                    if not (_predictions_dir / f"predicted_{_ts}_frame1.png").exists():
+                        continue
+                    # If window has passed, check whether actual frames exist.
+                    # If every one of the 5 target slots is more than 3 min from any
+                    # stored image, the data is permanently missing — mark skipped now.
+                    _current = int(time.time())
+                    if _current >= _ts + 25 * 60 and _available_ts:
+                        _unevaluable = False
+                        for _fn in range(1, 6):
+                            _target = _ts + _fn * 5 * 60
+                            _nearest = min(_available_ts, key=lambda x: abs(x - _target))
+                            if abs(_nearest - _target) > 3 * 60:
+                                _unevaluable = True
+                                break
+                        if _unevaluable:
+                            print(f"  [RECOVERY] Skipping unevaluable prediction from "
+                                  f"{datetime.fromtimestamp(_ts).strftime('%Y-%m-%d %H:%M:%S')} "
+                                  f"(actual frames missing — stuck radar gap)",
+                                  flush=True)
+                            with open(_mf, 'w') as _f:
+                                json.dump({'skipped': True, 'reason': 'missing_actual_frames'}, _f)
+                            continue
+                    pending_predictions.append(_ts)
+                    print(f"  [RECOVERY] Recovered pending prediction from "
+                          f"{datetime.fromtimestamp(_ts).strftime('%Y-%m-%d %H:%M:%S')}",
+                          flush=True)
+            except Exception:
+                pass
+    if pending_predictions:
+        print(f"  [RECOVERY] {len(pending_predictions)} pending prediction(s) re-queued for evaluation",
+              flush=True)
+    del _predictions_dir
     
     try:
         while True:
@@ -301,108 +359,115 @@ def continuous_learning():
                         frames_needed=frames_needed,
                         eta_minutes=frames_needed * 5,
                     )
-                    elapsed = time.time() - cycle_start
-                    time.sleep(max(0, 5 * 60 - elapsed))
-                    continue
+                    made_prediction = False
+                else:
+                    # Make 5 predictions recursively
+                    _write_predictor_status("predicting")
+                    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"\n[{timestamp_str}] Making 5-frame prediction #{prediction_count + 1}...")
+                    
+                    prediction_timestamp = int(time.time())
+                    predicted_frames_pil = []
+                    current_sequence = sequence.copy()
+                    
+                    for frame_num in range(5):
+                        # Predict next frame
+                        _frame_t = time.time()
+                        print(f"  [PREDICT] Frame {frame_num+1}/5...", end=" ", flush=True)
+                        prediction = model.predict(current_sequence)
+                        print(f"done ({time.time()-_frame_t:.1f}s)", flush=True)
 
-                # Make 5 predictions recursively
-                _write_predictor_status("predicting")
-                timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"\n[{timestamp_str}] Making 5-frame prediction #{prediction_count + 1}...")
-                
-                prediction_timestamp = int(time.time())
-                predicted_frames_pil = []
-                current_sequence = sequence.copy()
-                
-                for frame_num in range(5):
-                    # Predict next frame
-                    _frame_t = time.time()
-                    print(f"  [PREDICT] Frame {frame_num+1}/5...", end=" ", flush=True)
-                    prediction = model.predict(current_sequence)
-                    print(f"done ({time.time()-_frame_t:.1f}s)", flush=True)
+                        # Save individual frame to disk immediately
+                        pred_filename = f"data/predictions/predicted_{prediction_timestamp}_frame{frame_num+1}.png"
+                        pred_img = (prediction * 255).astype(np.uint8)
+                        pred_pil = Image.fromarray(pred_img)
+                        pred_pil.save(pred_filename)
+                        predicted_frames_pil.append(pred_pil)
 
-                    # Save individual frame to disk immediately
-                    pred_filename = f"data/predictions/predicted_{prediction_timestamp}_frame{frame_num+1}.png"
-                    pred_img = (prediction * 255).astype(np.uint8)
-                    pred_pil = Image.fromarray(pred_img)
-                    pred_pil.save(pred_filename)
-                    predicted_frames_pil.append(pred_pil)
+                        # Update sequence for next prediction: remove oldest, add prediction
+                        new_frame = np.expand_dims(prediction, axis=0)  # (1, 512, 512, 3)
+                        new_frame = np.expand_dims(new_frame, axis=1)   # (1, 1, 512, 512, 3)
+                        current_sequence = np.concatenate([current_sequence[:, 1:, :, :, :], new_frame], axis=1)
+                        del prediction, pred_img, new_frame
+                    
+                    # Free the large sequence arrays
+                    del current_sequence, sequence
+                    
+                    # Create prediction-only animated GIF
+                    prediction_frames_pil = predicted_frames_pil
+                    
+                    pred_only_filename = f"data/predictions/prediction_only_{prediction_timestamp}.gif"
+                    prediction_frames_pil[0].save(
+                        pred_only_filename,
+                        save_all=True,
+                        append_images=prediction_frames_pil[1:],
+                        duration=500,
+                        loop=0
+                    )
+                    
+                    # Create immediate "preview" comparison GIF (prediction-only, will be replaced later)
+                    comparison_preview_frames = []
+                    for pred_pil in prediction_frames_pil:
+                        # Create placeholder - just show prediction on left, gray placeholder on right
+                        placeholder = Image.new('RGB', (512, 512), color=(100, 100, 100))
+                        comparison = Image.new('RGB', (pred_pil.width * 2, pred_pil.height))
+                        comparison.paste(pred_pil, (0, 0))
+                        comparison.paste(placeholder, (pred_pil.width, 0))
+                        comparison_preview_frames.append(comparison)
+                    
+                    preview_filename = f"data/predictions/prediction_animation_{prediction_timestamp}.gif"
+                    comparison_preview_frames[0].save(
+                        preview_filename,
+                        save_all=True,
+                        append_images=comparison_preview_frames[1:],
+                        duration=500,
+                        loop=0,
+                        optimize=False
+                    )
+                    
+                    # Create placeholder metrics JSON
+                    placeholder_metrics = {
+                        'frames': [{'mse': 0, 'mae': 0, 'psnr': 0} for _ in range(5)],
+                        'average': {'mse': 0, 'mae': 0, 'psnr': 0},
+                        'pending': True
+                    }
+                    metrics_file = f"data/predictions/metrics_{prediction_timestamp}.json"
+                    with open(metrics_file, 'w') as f:
+                        json.dump(placeholder_metrics, f, indent=2)
+                    
+                    print(f"  All 5 frames predicted and saved")
+                    print(f"  Prediction animation: {pred_only_filename}")
+                    print(f"  Preview comparison: {preview_filename} (will update with actual in 25 min)")
+                    
+                    # Add to pending predictions (only timestamp, frames are on disk)
+                    pending_predictions.append(prediction_timestamp)
+                    
+                    # Free PIL frames
+                    del prediction_frames_pil, predicted_frames_pil, comparison_preview_frames
+                    gc.collect()
+                    
+                    # Clean up old files - run every cycle to keep disk usage minimal
+                    cleanup_old_predictions(pending_timestamps=pending_predictions)
 
-                    # Update sequence for next prediction: remove oldest, add prediction
-                    new_frame = np.expand_dims(prediction, axis=0)  # (1, 512, 512, 3)
-                    new_frame = np.expand_dims(new_frame, axis=1)   # (1, 1, 512, 512, 3)
-                    current_sequence = np.concatenate([current_sequence[:, 1:, :, :, :], new_frame], axis=1)
-                    del prediction, pred_img, new_frame
-                
-                # Free the large sequence arrays
-                del current_sequence, sequence
-                
-                # Create prediction-only animated GIF
-                prediction_frames_pil = predicted_frames_pil
-                
-                pred_only_filename = f"data/predictions/prediction_only_{prediction_timestamp}.gif"
-                prediction_frames_pil[0].save(
-                    pred_only_filename,
-                    save_all=True,
-                    append_images=prediction_frames_pil[1:],
-                    duration=500,
-                    loop=0
-                )
-                
-                # Create immediate "preview" comparison GIF (prediction-only, will be replaced later)
-                comparison_preview_frames = []
-                for pred_pil in prediction_frames_pil:
-                    # Create placeholder - just show prediction on left, gray placeholder on right
-                    placeholder = Image.new('RGB', (512, 512), color=(100, 100, 100))
-                    comparison = Image.new('RGB', (pred_pil.width * 2, pred_pil.height))
-                    comparison.paste(pred_pil, (0, 0))
-                    comparison.paste(placeholder, (pred_pil.width, 0))
-                    comparison_preview_frames.append(comparison)
-                
-                preview_filename = f"data/predictions/prediction_animation_{prediction_timestamp}.gif"
-                comparison_preview_frames[0].save(
-                    preview_filename,
-                    save_all=True,
-                    append_images=comparison_preview_frames[1:],
-                    duration=500,
-                    loop=0,
-                    optimize=False
-                )
-                
-                # Create placeholder metrics JSON
-                placeholder_metrics = {
-                    'frames': [{'mse': 0, 'mae': 0, 'psnr': 0} for _ in range(5)],
-                    'average': {'mse': 0, 'mae': 0, 'psnr': 0},
-                    'pending': True
-                }
-                metrics_file = f"data/predictions/metrics_{prediction_timestamp}.json"
-                with open(metrics_file, 'w') as f:
-                    json.dump(placeholder_metrics, f, indent=2)
-                
-                print(f"  All 5 frames predicted and saved")
-                print(f"  Prediction animation: {pred_only_filename}")
-                print(f"  Preview comparison: {preview_filename} (will update with actual in 25 min)")
-                
-                # Add to pending predictions (only timestamp, frames are on disk)
-                pending_predictions.append(prediction_timestamp)
-                
-                # Free PIL frames
-                del prediction_frames_pil, predicted_frames_pil, comparison_preview_frames
-                gc.collect()
-                
-                # Clean up old files - run every cycle to keep disk usage minimal
-                cleanup_old_predictions(pending_timestamps=pending_predictions)
-                
-                # Check if any predictions are ready to be evaluated (25 minutes old)
+                    prediction_count += 1
+                    made_prediction = True
+
+                # ── Evaluation runs every cycle, whether or not a prediction was made ──
+                # This ensures pending predictions are evaluated on time even when
+                # the prediction step was skipped (e.g. stuck radar).
                 current_time = int(time.time())
-                ready_predictions = [ts for ts in pending_predictions 
+                ready_predictions = [ts for ts in pending_predictions
                                     if current_time >= ts + 25 * 60]
 
                 if len(ready_predictions) > 1:
-                    print(f"  [EVAL] {len(ready_predictions)} evaluations ready — processing 1 per cycle to keep predictions on schedule", flush=True)
+                    print(f"  [EVAL] {len(ready_predictions)} evaluations ready — draining skipped, then 1 successful per cycle", flush=True)
 
-                # Evaluate at most 1 ready prediction per cycle to avoid blocking predictions
-                for pred_timestamp in ready_predictions[:1]:
+                # Skipped evaluations (missing actual frames) cost nothing — drain them all.
+                # Stop after 1 successful evaluation that triggers model training.
+                successful_evals = 0
+                for pred_timestamp in ready_predictions:
+                    if successful_evals >= 1:
+                        break
                     print(f"\n  Evaluating prediction from {datetime.fromtimestamp(pred_timestamp).strftime('%H:%M:%S')}...")
                     
                     # Reload predicted frames from disk
@@ -455,6 +520,14 @@ def continuous_learning():
                     if eval_skipped:
                         print(f"  [WARNING] Missing actual frames — skipping this evaluation")
                         pending_predictions.remove(pred_timestamp)
+                        # Write a minimal metrics file so the prediction still shows
+                        # in the web UI history (without accuracy numbers).
+                        try:
+                            metrics_file = f"data/predictions/metrics_{pred_timestamp}.json"
+                            with open(metrics_file, 'w') as f:
+                                json.dump({'skipped': True, 'reason': 'missing_actual_frames'}, f)
+                        except Exception:
+                            pass
                         del pred_frames
                         gc.collect()
                         continue
@@ -490,6 +563,7 @@ def continuous_learning():
                     )
                     
                     print(f"  [SUCCESS] Comparison updated with actual data: {animation_file}")
+                    successful_evals += 1
                     
                     # Update model with first frame — use the same 12-frame input
                     # the model saw at prediction time, NOT the current latest frames
@@ -514,8 +588,8 @@ def continuous_learning():
                     
                     # Remove from pending
                     pending_predictions.remove(pred_timestamp)
-                
-                prediction_count += 1
+
+                # ── Stats + sleep — always runs ──
                 print(f"\n  Total predictions: {prediction_count}", flush=True)
                 print(f"  Pending evaluations: {len(pending_predictions)}", flush=True)
                 print("-" * 70, flush=True)

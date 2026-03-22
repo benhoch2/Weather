@@ -530,6 +530,12 @@
                                     </div>
                                 </div>
                             `;
+                        } else if (pred.metrics.skipped) {
+                            metricsHTML = `
+                                <div style="color:#999; font-size:0.85em; margin-top:6px;">
+                                    ⚠️ Accuracy metrics unavailable — actual radar data was missing during evaluation.
+                                </div>
+                            `;
                         } else {
                             metricsHTML = `
                                 <div class="metrics">
