@@ -8,53 +8,13 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+from process_utils import acquire_lock, release_lock
 
 # ── Duplicate-process guard ───────────────────────────────────────────────────
 # If another instance of this script is already running, refuse to start.
 # This prevents the "two predictors eating each other's history" bug.
 
 PREDICTOR_LOCK = Path(__file__).parent / "predictor.lock"
-
-
-def _is_pid_running(pid: int) -> bool:
-    """Return True when a **Python** process with this PID is alive."""
-    try:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.splitlines():
-            if str(pid) in line and "python" in line.lower():
-                return True
-        return False
-    except Exception:
-        return False
-
-
-def acquire_predictor_lock() -> None:
-    if PREDICTOR_LOCK.exists():
-        try:
-            pid = int(PREDICTOR_LOCK.read_text().strip())
-            if _is_pid_running(pid):
-                print(f"[PERSISTENT] ERROR: A prediction engine is already running (PID {pid}).")
-                print(f"[PERSISTENT]   Stop it first, or delete {PREDICTOR_LOCK} if it is stale.")
-                sys.exit(1)
-            else:
-                print(f"[PERSISTENT] Cleaning stale lock (PID {pid} is gone)")
-                PREDICTOR_LOCK.unlink(missing_ok=True)
-        except (ValueError, SystemExit):
-            raise
-        except Exception:
-            PREDICTOR_LOCK.unlink(missing_ok=True)  # Unreadable — remove
-    PREDICTOR_LOCK.write_text(str(os.getpid()))
-    print(f"[PERSISTENT] Lock acquired (PID {os.getpid()})")
-
-
-def release_predictor_lock() -> None:
-    try:
-        PREDICTOR_LOCK.unlink(missing_ok=True)
-    except Exception:
-        pass
 
 log_file = Path("prediction_errors.log")
 
@@ -80,19 +40,24 @@ def run_predictions():
             restart_count += 1
             log_message(f"\nStarting predict_continuous.py (attempt #{restart_count})")
             
-            # Run the prediction script with -u for unbuffered output
+            # Run the prediction script - binary pipe (bufsize=0) bypasses all
+            # Python text-layer buffering so every line reaches us immediately.
             process = subprocess.Popen(
                 [sys.executable, "-u", "predict_continuous.py"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                bufsize=0,
                 env={**__import__('os').environ, "PYTHONUNBUFFERED": "1", "TF_ENABLE_ONEDNN_OPTS": "0"}
             )
             
-            # Stream output in real-time
-            for line in process.stdout:
-                print(line, end='')
+            # Stream output in real-time — write raw bytes straight to our
+            # stdout buffer so there are zero extra buffering layers.
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    break
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
                 
             # Wait for process to complete
             return_code = process.wait()
@@ -119,8 +84,8 @@ def run_predictions():
         time.sleep(wait_time)
 
 if __name__ == "__main__":
-    acquire_predictor_lock()
+    acquire_lock(PREDICTOR_LOCK, "PERSISTENT")
     try:
         run_predictions()
     finally:
-        release_predictor_lock()
+        release_lock(PREDICTOR_LOCK)

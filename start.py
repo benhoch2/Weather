@@ -26,6 +26,7 @@ import time
 import argparse
 from datetime import datetime
 from pathlib import Path
+from process_utils import is_pid_running
 
 # ── Lock file -----------------------------------------------------------------
 # Prevents double-starting the whole app (e.g. clicking start_viewer.bat twice)
@@ -37,35 +38,28 @@ CHILD_LOCKS = [PROJECT_DIR / "predictor.lock", PROJECT_DIR / "fetcher.lock"]
 RESTART_DELAY = 10
 
 
-def _is_pid_running(pid: int) -> bool:
-    """Return True when a **Python** process with this PID is alive.
-
-    Plain PID checks cause false positives on Windows because PIDs get
-    recycled quickly.  We also verify the image name contains 'python'.
-    """
-    try:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.splitlines():
-            if str(pid) in line and "python" in line.lower():
-                return True
-        return False
-    except Exception:
-        return False  # Treat as stale lock when we cannot verify
-
-
 def _clean_stale_locks() -> None:
-    """Remove child lock files whose owner process is no longer alive."""
+    """Remove child lock files, killing the owner if it is still alive.
+
+    Any process holding a child lock when start.py runs is an orphan from a
+    previous launcher session.  Kill it so the new child can acquire the lock.
+    """
     for lock in CHILD_LOCKS:
         if not lock.exists():
             continue
         try:
             pid = int(lock.read_text().strip())
-            if not _is_pid_running(pid):
-                lock.unlink(missing_ok=True)
-                print(f"[{_ts()}] {_label('LAUNCHER')} Removed stale lock: {lock.name} (PID {pid} is gone)")
+            if is_pid_running(pid):
+                print(f"[{_ts()}] {_label('LAUNCHER')} Killing orphan PID {pid} holding {lock.name}...")
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        capture_output=True, timeout=10,
+                    )
+                except Exception:
+                    pass
+            lock.unlink(missing_ok=True)
+            print(f"[{_ts()}] {_label('LAUNCHER')} Cleared lock: {lock.name}")
         except Exception:
             lock.unlink(missing_ok=True)
 
@@ -74,7 +68,7 @@ def acquire_app_lock() -> None:
     if APP_LOCK.exists():
         try:
             pid = int(APP_LOCK.read_text().strip())
-            if _is_pid_running(pid):
+            if is_pid_running(pid):
                 print(f"[LAUNCHER] ERROR: App is already running (PID {pid}).")
                 print(f"[LAUNCHER]   Close that window first, or delete {APP_LOCK} if it is stale.")
                 sys.exit(1)
@@ -119,8 +113,11 @@ def stream_output(proc: subprocess.Popen, tag: str) -> None:
     """Read lines from *proc* stdout and print with a labelled prefix (runs in a daemon thread)."""
     label = _label(tag)
     try:
-        for line in proc.stdout:
-            line = line.rstrip("\n")
+        while True:
+            line = proc.stdout.readline()  # bytes
+            if not line:
+                break
+            line = line.rstrip(b"\r\n").decode(errors="replace")
             if line:
                 print(f"{label} {line}", flush=True)
     except Exception:
@@ -131,10 +128,12 @@ def stream_output(proc: subprocess.Popen, tag: str) -> None:
 
 # Each entry: (tag, command-args builder)
 # The builder is a callable so we can reference args.port lazily.
+_web_debug = False  # Set to True in main() when --web-debug is passed
+
 _COMMANDS = {
     "FETCHER":   lambda: [sys.executable, "-u", "fetch_radar_continuous.py"],
     "PREDICTOR": lambda: [sys.executable, "-u", "run_predictions_persistent.py"],
-    "WEB":       lambda: [sys.executable, "-u", "web_viewer.py"],
+    "WEB":       lambda: [sys.executable, "-u", "web_viewer.py"] + (["--web-debug"] if _web_debug else []),
 }
 
 
@@ -143,7 +142,7 @@ def _start_process(tag: str, env: dict, project_dir: Path) -> subprocess.Popen:
     proc = subprocess.Popen(
         _COMMANDS[tag](),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, cwd=project_dir, env=env,
+        bufsize=0, cwd=project_dir, env=env,
     )
     threading.Thread(
         target=stream_output, args=(proc, tag), daemon=True,
@@ -155,7 +154,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Weather Radar Prediction System launcher")
     parser.add_argument("--port", type=int, default=int(os.environ.get("WEATHER_RADAR_VIEWER_PORT", 5050)),
                         help="Port for the web viewer (default: 5050)")
+    parser.add_argument("--web-debug", action="store_true",
+                        help="Show HTTP access log lines from the web server")
     args = parser.parse_args()
+
+    global _web_debug
+    _web_debug = args.web_debug
 
     acquire_app_lock()
 

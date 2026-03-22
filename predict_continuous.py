@@ -16,6 +16,18 @@ import json
 from data_manager import RadarDataManager
 from radar_model import RadarPredictionModel
 
+_STATUS_FILE = Path("data/predictor_status.json")
+
+def _write_predictor_status(status: str, **extra):
+    """Atomically write predictor status JSON so downstream tools (web UI) can read it."""
+    payload = {"status": status, "updated_at": int(time.time())}
+    payload.update(extra)
+    try:
+        _STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _STATUS_FILE.write_text(json.dumps(payload))
+    except Exception:
+        pass
+
 def calculate_image_metrics(predicted, actual):
     """
     Calculate metrics to compare predicted and actual images.
@@ -129,9 +141,10 @@ def cleanup_old_predictions(pending_timestamps=None):
         )
         
         # Keep only the 20 most recent timestamps
-        if len(animations) > 20:
+        max_keep = 20
+        if len(animations) > max_keep:
             keep_timestamps = set()
-            for anim in animations[:20]:
+            for anim in animations[:max_keep]:
                 timestamp = anim.stem.split('_')[-1]
                 keep_timestamps.add(timestamp)
             
@@ -142,13 +155,13 @@ def cleanup_old_predictions(pending_timestamps=None):
             deleted_count = 0
             
             # Delete old prediction animations
-            for anim in animations[20:]:
+            for anim in animations[max_keep:]:
                 ts = anim.stem.split('_')[-1]
                 if ts not in keep_timestamps:
                     anim.unlink()
                     deleted_count += 1
             
-            # Delete all prediction_only GIFs (not needed for web viewer)
+            # Delete prediction_only GIFs not in the keep set
             for pred_only in predictions_dir.glob("prediction_only_*.gif"):
                 timestamp = pred_only.stem.split('_')[-1]
                 if timestamp not in keep_timestamps:
@@ -225,6 +238,10 @@ def continuous_learning():
         model.build_model()
         model.save('radar_model.keras')
     
+    # Lower the learning rate for online single-sample updates
+    model.model.optimizer.learning_rate.assign(0.0001)
+    print("  Online learning rate set to 0.0001")
+
     print()
     print("Model loaded and ready.", flush=True)
     print("Making predictions every 5 minutes...", flush=True)
@@ -235,6 +252,7 @@ def continuous_learning():
     print("-" * 70)
     
     prediction_count = 0
+    train_count = 0  # Number of online learning updates since launch
     pending_predictions = []  # List of prediction timestamps (frames stored on disk)
     
     try:
@@ -263,7 +281,32 @@ def continuous_learning():
                           f"(newest frame: {datetime.fromtimestamp(newest_ts).strftime('%H:%M:%S')}, "
                           f"{newest_age}m ago)", flush=True)
 
+                # Check for duplicate consecutive frames — indicates a stuck radar source.
+                # More than 1 duplicate in the 12-frame window means the input is
+                # unreliable and the prediction should be skipped.
+                frames = sequence[0]  # (12, 512, 512, 3)
+                duplicate_count = sum(
+                    1 for i in range(1, len(frames))
+                    if np.array_equal(frames[i], frames[i - 1])
+                )
+                if duplicate_count > 1:
+                    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"\n[{timestamp_str}] [WARNING] Sequence has {duplicate_count} duplicate "
+                          f"consecutive frame(s) — radar source appears stuck. Skipping prediction.",
+                          flush=True)
+                    frames_needed = duplicate_count - 1
+                    _write_predictor_status(
+                        "stuck",
+                        duplicate_count=duplicate_count,
+                        frames_needed=frames_needed,
+                        eta_minutes=frames_needed * 5,
+                    )
+                    elapsed = time.time() - cycle_start
+                    time.sleep(max(0, 5 * 60 - elapsed))
+                    continue
+
                 # Make 5 predictions recursively
+                _write_predictor_status("predicting")
                 timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"\n[{timestamp_str}] Making 5-frame prediction #{prediction_count + 1}...")
                 
@@ -354,9 +397,12 @@ def continuous_learning():
                 current_time = int(time.time())
                 ready_predictions = [ts for ts in pending_predictions 
                                     if current_time >= ts + 25 * 60]
-                
-                # Evaluate ready predictions
-                for pred_timestamp in ready_predictions:
+
+                if len(ready_predictions) > 1:
+                    print(f"  [EVAL] {len(ready_predictions)} evaluations ready — processing 1 per cycle to keep predictions on schedule", flush=True)
+
+                # Evaluate at most 1 ready prediction per cycle to avoid blocking predictions
+                for pred_timestamp in ready_predictions[:1]:
                     print(f"\n  Evaluating prediction from {datetime.fromtimestamp(pred_timestamp).strftime('%H:%M:%S')}...")
                     
                     # Reload predicted frames from disk
@@ -384,11 +430,19 @@ def continuous_learning():
                     
                     actual_frames = []
                     frame_metrics = []
+                    eval_skipped = False
                     
                     for frame_num in range(5):
                         # Find actual image for this frame
                         target_time = pred_timestamp + (frame_num + 1) * 5 * 60
                         actual_image = min(images, key=lambda x: abs(x[0] - target_time))
+                        
+                        # Reject if the closest frame is more than 3 minutes off
+                        time_off = abs(actual_image[0] - target_time)
+                        if time_off > 3 * 60:
+                            print(f"  [WARNING] Frame {frame_num+1}: nearest actual is {time_off}s off target — skipping evaluation")
+                            eval_skipped = True
+                            break
                         
                         # Load the actual image
                         actual = data_manager.load_image(actual_image[1])
@@ -397,6 +451,13 @@ def continuous_learning():
                         # Calculate metrics
                         metrics = calculate_image_metrics(pred_frames[frame_num], actual)
                         frame_metrics.append(metrics)
+                    
+                    if eval_skipped:
+                        print(f"  [WARNING] Missing actual frames — skipping this evaluation")
+                        pending_predictions.remove(pred_timestamp)
+                        del pred_frames
+                        gc.collect()
+                        continue
                     
                     # Calculate averages
                     avg_mse = sum(m['mse'] for m in frame_metrics) / len(frame_metrics)
@@ -430,14 +491,19 @@ def continuous_learning():
                     
                     print(f"  [SUCCESS] Comparison updated with actual data: {animation_file}")
                     
-                    # Update model with first frame
-                    new_sequence = data_manager.get_latest_sequence(min_timestamp=fresh_cutoff)
+                    # Update model with first frame — use the same 12-frame input
+                    # the model saw at prediction time, NOT the current latest frames
+                    new_sequence = data_manager.get_sequence_before_timestamp(pred_timestamp, min_timestamp=fresh_cutoff)
                     if new_sequence is not None:
                         target = np.expand_dims(actual_frames[0], axis=0)
                         try:
                             result = model.train_on_batch(new_sequence, target)
                             loss_value = result[0] if isinstance(result, list) else result
                             print(f"  Model updated - Loss: {loss_value:.6f}")
+                            train_count += 1
+                            if train_count % 5 == 0:
+                                model.save('radar_model.keras')
+                                print(f"  [SAVE] Model checkpoint (after {train_count} updates)")
                         except Exception as train_err:
                             print(f"  [WARNING] Skipping model update (training failed: {train_err})")
                         del new_sequence, target
@@ -450,9 +516,9 @@ def continuous_learning():
                     pending_predictions.remove(pred_timestamp)
                 
                 prediction_count += 1
-                print(f"\n  Total predictions: {prediction_count}")
-                print(f"  Pending evaluations: {len(pending_predictions)}")
-                print("-" * 70)
+                print(f"\n  Total predictions: {prediction_count}", flush=True)
+                print(f"  Pending evaluations: {len(pending_predictions)}", flush=True)
+                print("-" * 70, flush=True)
                 
                 # Sleep only the remaining time to keep a strict 5-minute cycle
                 elapsed = time.time() - cycle_start

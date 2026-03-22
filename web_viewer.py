@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import time
+from process_utils import is_pid_running
 
 app = Flask(__name__)
 
@@ -36,16 +37,7 @@ def _lock_info():
         if not PREDICTOR_LOCK.exists():
             return None, None
         pid = int(PREDICTOR_LOCK.read_text().strip())
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=5,
-        )
-        # Verify it's actually a python process, not a recycled PID
-        is_python = any(
-            str(pid) in line and "python" in line.lower()
-            for line in result.stdout.splitlines()
-        )
-        if not is_python:
+        if not is_pid_running(pid):
             return None, None  # Stale lock
         started_at = int(PREDICTOR_LOCK.stat().st_mtime)
         return pid, started_at
@@ -231,10 +223,15 @@ class PredictionViewer:
                 'avg_psnr': None
             }
         
-        # Handle missing keys gracefully
-        mse_values = [m['mse'] for m in metrics_list if 'mse' in m]
-        mae_values = [m['mae'] for m in metrics_list if 'mae' in m]
-        psnr_values = [m['psnr'] for m in metrics_list if 'psnr' in m]
+        # Handle both old (flat) and new (nested 'average') metric formats
+        def _avg(m, key):
+            if 'average' in m and key in m['average']:
+                return m['average'][key]
+            return m.get(key)
+
+        mse_values = [v for m in metrics_list if (v := _avg(m, 'mse')) is not None]
+        mae_values = [v for m in metrics_list if (v := _avg(m, 'mae')) is not None]
+        psnr_values = [v for m in metrics_list if (v := _avg(m, 'psnr')) is not None]
         
         avg_mse = sum(mse_values) / len(mse_values) if mse_values else None
         avg_mae = sum(mae_values) / len(mae_values) if mae_values else None
@@ -385,6 +382,36 @@ def prediction_status():
 
     return jsonify({'running': False, 'pid': None})
 
+@app.route('/api/radar_health')
+def radar_health():
+    """
+    Return predictor health from the status file written by predict_continuous.py.
+    Falls back to OK if the status file is absent or stale (>15 min old).
+    """
+    status_file = Path("data/predictor_status.json")
+    if status_file.exists():
+        try:
+            data = json.loads(status_file.read_text())
+            age_s = int(time.time()) - data.get("updated_at", 0)
+            # Treat status as expired after 15 min (3 prediction cycles missed)
+            if age_s <= 900 and data.get("status") == "stuck":
+                dup = data.get("duplicate_count", 0)
+                needed = data.get("frames_needed", max(0, dup - 1))
+                eta = data.get("eta_minutes", needed * 5)
+                return jsonify({
+                    'stuck': True,
+                    'duplicate_count': dup,
+                    'frames_needed': needed,
+                    'eta_minutes': eta,
+                    'message': (
+                        f'{dup} duplicate frame(s) in sequence \u2014 '
+                        f'{needed} more unique frame(s) needed (~{eta} min)'
+                    ),
+                })
+        except Exception:
+            pass
+    return jsonify({'stuck': False, 'duplicate_count': 0, 'frames_needed': 0, 'eta_minutes': 0, 'message': 'OK'})
+
 @app.route('/api/readiness')
 def get_readiness():
     """Return how many fresh radar frames have arrived since the predictor was started."""
@@ -446,6 +473,18 @@ def get_readiness():
     })
 
 if __name__ == '__main__':
+    import logging
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--web-debug', action='store_true',
+                        help='Show HTTP access log lines from the web server')
+    args = parser.parse_args()
+
+    if not args.web_debug:
+        # Suppress werkzeug's per-request access log (the [WEB] GET /api/... lines)
+        logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
     port = int(os.environ.get('WEATHER_RADAR_VIEWER_PORT', DEFAULT_PORT))
     print("=" * 70)
     print("Weather Radar Prediction Viewer")
@@ -453,10 +492,12 @@ if __name__ == '__main__':
     print()
     print("Starting web interface...")
     print(f"Open your browser and go to: http://localhost:{port}")
+    if not args.web_debug:
+        print("(HTTP access logs hidden — run with --web-debug to show them)")
     print()
     print("Press Ctrl+C to stop the server")
     print("=" * 70)
-    
+
     # use_reloader=False prevents the werkzeug file-watcher from killing the
     # prediction subprocess reference stored in global variables on file changes.
     app.run(debug=True, use_reloader=False, host='0.0.0.0', port=port)

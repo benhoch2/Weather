@@ -334,6 +334,21 @@
                 <span id="status-text">Status: Stopped</span>
             </div>
         </div>
+        <!-- Stuck Radar Warning Banner -->
+        <div id="stuck-radar-banner" style="display:none; background:#fff3cd; border:2px solid #ffc107; border-radius:12px; padding:16px 24px; margin-bottom:20px; box-shadow:0 5px 15px rgba(0,0,0,0.15);">
+            <div style="display:flex; align-items:center; gap:12px;">
+                <span style="font-size:1.8em;">&#9888;&#65039;</span>
+                <div style="flex:1;">
+                    <strong style="color:#856404; font-size:1.1em;">Radar Source Stuck &mdash; Predictions Paused</strong>
+                    <p style="color:#856404; margin-top:4px; font-size:0.95em;" id="stuck-radar-message">The radar site appears to be returning the same image repeatedly.</p>
+                    <div id="stuck-radar-detail" style="margin-top:8px; display:flex; gap:24px; flex-wrap:wrap;">
+                        <span style="background:#ffc107; color:#533f03; border-radius:8px; padding:3px 12px; font-size:0.88em; font-weight:bold;" id="stuck-frames-badge"></span>
+                        <span style="background:#856404; color:#fff; border-radius:8px; padding:3px 12px; font-size:0.88em; font-weight:bold;" id="stuck-eta-badge"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Warmup Panel: shown while waiting for 12 fresh frames -->
         <div class="warmup-panel" id="warmup-panel" style="display: none;">
             <h3 style="color: #667eea; margin-bottom: 12px;">&#9203; Warming Up &mdash; Collecting Fresh Frames</h3>
@@ -636,6 +651,34 @@
             }
         }
 
+        async function loadRadarHealth() {
+            try {
+                const resp = await fetch('/api/radar_health');
+                const data = await resp.json();
+                const banner = document.getElementById('stuck-radar-banner');
+                const msg = document.getElementById('stuck-radar-message');
+                const framesBadge = document.getElementById('stuck-frames-badge');
+                const etaBadge = document.getElementById('stuck-eta-badge');
+                if (data.stuck) {
+                    const dup = data.duplicate_count || 0;
+                    const needed = data.frames_needed || 0;
+                    const eta = data.eta_minutes || 0;
+                    msg.textContent = `${dup} duplicate consecutive frame(s) in the 12-frame sequence — predictions are being skipped.`;
+                    framesBadge.textContent = `${needed} unique frame(s) needed to resume`;
+                    // Compute absolute ETA clock time
+                    const etaTime = new Date(Date.now() + eta * 60 * 1000);
+                    const hh = etaTime.getHours().toString().padStart(2, '0');
+                    const mm = etaTime.getMinutes().toString().padStart(2, '0');
+                    etaBadge.textContent = `Next prediction ~${hh}:${mm} (in ${eta} min)`;
+                    banner.style.display = 'block';
+                } else {
+                    banner.style.display = 'none';
+                }
+            } catch (error) {
+                console.error('Error loading radar health:', error);
+            }
+        }
+
         async function loadReadiness() {
             try {
                 const resp = await fetch('/api/readiness');
@@ -726,9 +769,13 @@
 
         // Load data on page load
         loadData();
+        loadRadarHealth();
 
         // Auto-refresh data every 30 seconds
         setInterval(loadData, 30000);
+
+        // Check radar health every 30 seconds
+        setInterval(loadRadarHealth, 30000);
         
         // Update prediction status more frequently (every 5 seconds)
         setInterval(updatePredictionStatus, 5000);

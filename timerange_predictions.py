@@ -84,9 +84,14 @@ def process_sequences():
     images = data_manager.get_all_radar_images()
     print(f"Found {len(images)} total images")
     
-    # Filter images in time range
-    start_time = 1767272839
-    end_time = 1767295457
+    # Filter images in time range (CLI args or default to full corpus)
+    import sys as _sys
+    if len(_sys.argv) >= 3:
+        start_time = int(_sys.argv[1])
+        end_time = int(_sys.argv[2])
+    else:
+        start_time = images[0][0]
+        end_time = images[-1][0]
     
     # Find start and end indices
     start_idx = None

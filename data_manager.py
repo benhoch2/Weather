@@ -165,6 +165,36 @@ class RadarDataManager:
         # Add batch dimension
         return np.array([sequence], dtype=np.float32)
     
+    def get_sequence_before_timestamp(self, timestamp, min_timestamp=None):
+        """
+        Get the 12 most recent frames with timestamps <= the given timestamp.
+        Reconstructs the input sequence as it existed at a past point in time.
+
+        Args:
+            timestamp: Unix timestamp upper bound (inclusive)
+            min_timestamp: Optional lower bound for eligible frames
+
+        Returns:
+            numpy array of shape (1, sequence_length, height, width, channels)
+            or None if not enough images
+        """
+        if min_timestamp is None:
+            images = self.get_all_radar_images()
+        else:
+            images = self.get_radar_images_since(min_timestamp)
+
+        eligible = [img for img in images if img[0] <= timestamp]
+
+        if len(eligible) < self.sequence_length:
+            return None
+
+        sequence = []
+        for i in range(self.sequence_length):
+            img = self.load_image(eligible[-(self.sequence_length - i)][1])
+            sequence.append(img)
+
+        return np.array([sequence], dtype=np.float32)
+
     def save_metadata(self, metadata, filename="training_metadata.json"):
         """
         Save training metadata to a JSON file.

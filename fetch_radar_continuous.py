@@ -1,63 +1,28 @@
 import requests
 from PIL import Image
 from io import BytesIO
+import hashlib
 import time
-import subprocess
-import sys
 from datetime import datetime
 from pathlib import Path
 import os
+from process_utils import acquire_lock, release_lock
 
 DEFAULT_MAX_STORED_IMAGES = 0
+
+# Track the hash of the last successfully saved image to detect a stuck radar source
+_last_content_hash: str | None = None
 
 # ── Duplicate-process guard ──────────────────────────────────────────────────
 FETCHER_LOCK = Path(__file__).parent / "fetcher.lock"
 
-
-def _is_pid_running(pid: int) -> bool:
-    try:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.splitlines():
-            if str(pid) in line and "python" in line.lower():
-                return True
-        return False
-    except Exception:
-        return False
-
-
-def acquire_fetcher_lock() -> None:
-    if FETCHER_LOCK.exists():
-        try:
-            pid = int(FETCHER_LOCK.read_text().strip())
-            if _is_pid_running(pid):
-                print(f"[FETCHER] ERROR: A radar fetcher is already running (PID {pid}).")
-                print(f"[FETCHER]   Stop it first, or delete {FETCHER_LOCK} if it is stale.")
-                sys.exit(1)
-            else:
-                print(f"[FETCHER] Cleaning stale lock (PID {pid} is gone)")
-                FETCHER_LOCK.unlink(missing_ok=True)
-        except (ValueError, SystemExit):
-            raise
-        except Exception:
-            FETCHER_LOCK.unlink(missing_ok=True)
-    FETCHER_LOCK.write_text(str(os.getpid()))
-    print(f"[FETCHER] Lock acquired (PID {os.getpid()})")
-
-
-def release_fetcher_lock() -> None:
-    try:
-        FETCHER_LOCK.unlink(missing_ok=True)
-    except Exception:
-        pass
 
 def fetch_radar_image():
     """
     Fetches the latest radar image from weather2day.co.il
     and saves it with an epoch timestamp filename.
     """
+    global _last_content_hash
     # The radar.php endpoint returns the PNG image directly
     radar_image_url = "https://www.weather2day.co.il/radar.php"
     
@@ -70,6 +35,13 @@ def fetch_radar_image():
         print(f"[{timestamp_str}] Fetching radar image...")
         print(f"  Content-Type: {response.headers.get('Content-Type')}")
         print(f"  Content size: {len(response.content)} bytes")
+
+        # Detect stuck radar source: same bytes as last fetch → skip saving
+        content_hash = hashlib.md5(response.content).hexdigest()
+        if content_hash == _last_content_hash:
+            print(f"  [WARNING] Radar source stuck — image unchanged from previous fetch, skipping save.")
+            return None
+        _last_content_hash = content_hash
         
         # Get current epoch timestamp for filename
         current_timestamp = int(time.time())
@@ -137,7 +109,7 @@ def main():
     """
     Continuously fetch radar images every 5 minutes.
     """
-    acquire_fetcher_lock()
+    acquire_lock(FETCHER_LOCK, "FETCHER")
 
     print("=" * 60)
     print("Weather Radar Image Fetcher")
@@ -181,7 +153,7 @@ def main():
         print("Stopped by user. Goodbye!")
         print("=" * 60)
     finally:
-        release_fetcher_lock()
+        release_lock(FETCHER_LOCK)
 
 if __name__ == "__main__":
     main()
