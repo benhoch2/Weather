@@ -2,69 +2,99 @@ import requests
 from PIL import Image
 from io import BytesIO
 import hashlib
+import json
 import time
 from datetime import datetime
 from pathlib import Path
 import os
 from process_utils import acquire_lock, release_lock
 
-DEFAULT_MAX_STORED_IMAGES = 0
+DEFAULT_MAX_STORED_IMAGES = 500
 
 # Track the hash of the last successfully saved image to detect a stuck radar source
 _last_content_hash: str | None = None
+
+_FETCHER_STATUS_FILE = Path("data/fetcher_status.json")
 
 # ── Duplicate-process guard ──────────────────────────────────────────────────
 FETCHER_LOCK = Path(__file__).parent / "fetcher.lock"
 
 
-def fetch_radar_image():
+def _next_slot_time():
+    """Return the epoch time of the next 5-minute wall-clock boundary."""
+    now = time.time()
+    slot = 5 * 60
+    return int((now // slot) + 1) * slot
+
+
+def _write_fetcher_status(slot_ts, *, duplicate=False):
+    """Write a small JSON so the web UI can report duplicate/lost frames."""
+    slot_str = datetime.fromtimestamp(slot_ts).strftime("%Y-%m-%d %H:%M")
+    payload = {
+        "updated_at": int(time.time()),
+        "last_slot": slot_ts,
+        "last_slot_str": slot_str,
+        "duplicate": duplicate,
+    }
+    try:
+        _FETCHER_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _FETCHER_STATUS_FILE.write_text(json.dumps(payload))
+    except Exception:
+        pass
+
+
+def fetch_radar_image(slot_ts):
     """
     Fetches the latest radar image from weather2day.co.il
-    and saves it with an epoch timestamp filename.
+    and saves it with the scheduled slot epoch timestamp as filename.
+
+    Returns the saved filename, or None on failure/duplicate.
     """
     global _last_content_hash
-    # The radar.php endpoint returns the PNG image directly
     radar_image_url = "https://www.weather2day.co.il/radar.php"
-    
+
+    slot_str = datetime.fromtimestamp(slot_ts).strftime("%Y-%m-%d %H:%M:%S")
+    filename = f"data/radar_images/radar_{slot_ts}.png"
+
+    # Skip if this slot was already fetched (e.g. server restarted)
+    if Path(filename).exists():
+        print(f"  [SKIP] Image for slot {slot_str} already exists on disk — skipping fetch.")
+        return filename
+
     try:
-        # Fetch the radar image
+        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp_str}] Fetching radar image for slot {slot_str}...")
+
         response = requests.get(radar_image_url, timeout=10)
         response.raise_for_status()
-        
-        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp_str}] Fetching radar image...")
+
         print(f"  Content-Type: {response.headers.get('Content-Type')}")
         print(f"  Content size: {len(response.content)} bytes")
 
         # Detect stuck radar source: same bytes as last fetch → skip saving
         content_hash = hashlib.md5(response.content).hexdigest()
         if content_hash == _last_content_hash:
-            print(f"  [WARNING] Radar source stuck — image unchanged from previous fetch, skipping save.")
+            print(f"  [DUPLICATE] Slot {slot_str} — image identical to previous fetch, skipping save.")
+            _write_fetcher_status(slot_ts, duplicate=True)
             return None
         _last_content_hash = content_hash
-        
-        # Get current epoch timestamp for filename
-        current_timestamp = int(time.time())
-        filename = f"data/radar_images/radar_{current_timestamp}.png"
-        
+
         # Open and process the image
         img = Image.open(BytesIO(response.content))
-        
+
         # If it's an animated PNG (APNG), get the last frame
         if hasattr(img, 'n_frames') and img.n_frames > 1:
-            # Seek to the last frame
             img.seek(img.n_frames - 1)
             print(f"  Animated PNG with {img.n_frames} frames. Extracting last frame.")
-        
-        # Save the image
+
         img.save(filename)
         print(f"  [OK] Saved as: {filename}")
-        
-        # Clean up old images - keep only last 12
+        _write_fetcher_status(slot_ts, duplicate=False)
+
         cleanup_old_images()
-        
+
         return filename
-            
+
     except requests.exceptions.RequestException as e:
         print(f"  [ERROR] Error fetching radar data: {e}")
         return None
@@ -107,45 +137,53 @@ def cleanup_old_images():
 
 def main():
     """
-    Continuously fetch radar images every 5 minutes.
+    Continuously fetch radar images aligned to 5-minute wall-clock slots
+    (XX:00, XX:05, XX:10, … XX:55).
     """
     acquire_lock(FETCHER_LOCK, "FETCHER")
 
     print("=" * 60)
     print("Weather Radar Image Fetcher")
-    print("Fetching radar images every 5 minutes")
+    print("Fetching at 5-minute wall-clock intervals")
     print("Press Ctrl+C to stop")
     print("=" * 60)
     print()
 
-    # Count how many images are already stored so the predictor can see the corpus size
+    # Count how many images are already stored
     existing = sorted(Path("data/radar_images").glob("radar_*.png"))
     print(f"[FETCHER] Found {len(existing)} existing radar image(s) on disk")
     if existing:
         newest_ts = int(existing[-1].stem.split('_')[1])
         print(f"[FETCHER] Newest stored image: {datetime.fromtimestamp(newest_ts).strftime('%Y-%m-%d %H:%M:%S')}")
-    print()
 
-    interval_seconds = 5 * 60  # 5 minutes
+    # Wait until the next 5-minute boundary before the first fetch
+    next_slot = _next_slot_time()
+    wait_sec = max(0, next_slot - time.time())
+    next_slot_str = datetime.fromtimestamp(next_slot).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[FETCHER] Waiting for next 5-min slot: {next_slot_str} (in {int(wait_sec)}s)")
+    print()
+    time.sleep(wait_sec)
 
     try:
         while True:
-            fetch_start = time.time()
-            result = fetch_radar_image()
-            fetch_elapsed = time.time() - fetch_start
+            slot_ts = int((time.time() // (5 * 60)) * (5 * 60))
+            slot_str = datetime.fromtimestamp(slot_ts).strftime("%Y-%m-%d %H:%M:%S")
+
+            result = fetch_radar_image(slot_ts)
 
             if result:
                 total = len(list(Path("data/radar_images").glob("radar_*.png")))
-                print(f"  [FETCHER] Stored {total} image(s) total  (fetch took {fetch_elapsed:.1f}s)")
+                print(f"  [FETCHER] Stored {total} image(s) total")
             else:
-                print(f"  [FETCHER] Fetch failed — will retry at next interval")
+                print(f"  [FETCHER] No new image saved for slot {slot_str}")
 
-            next_fetch = datetime.now().timestamp() + interval_seconds
-            next_fetch_time = datetime.fromtimestamp(next_fetch).strftime("%Y-%m-%d %H:%M:%S")
-            print(f"  Next fetch at: {next_fetch_time}")
+            # Sleep until the next 5-minute boundary
+            next_slot = _next_slot_time()
+            wait_sec = max(0, next_slot - time.time())
+            next_slot_str = datetime.fromtimestamp(next_slot).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"  Next fetch at: {next_slot_str} (in {int(wait_sec)}s)")
             print()
-
-            time.sleep(interval_seconds)
+            time.sleep(wait_sec)
 
     except KeyboardInterrupt:
         print("\n")

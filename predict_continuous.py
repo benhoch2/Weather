@@ -317,50 +317,94 @@ def continuous_learning():
         while True:
             try:
                 cycle_start = time.time()
-                # Only predict once this run has accumulated a full fresh window.
-                sequence = data_manager.get_latest_sequence(min_timestamp=fresh_cutoff)
-                
-                if sequence is None:
-                    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    fresh_count = data_manager.count_radar_images_since(fresh_cutoff)
-                    print(
-                        f"[{timestamp_str}] Waiting for 12 new images from this run "
-                        f"({fresh_count}/12 collected since {run_start_str})..."
-                    )
-                    time.sleep(60)  # Check every minute
-                    continue
 
-                # Log what was loaded so data pipeline issues are easy to spot
-                newest_in_seq = data_manager.get_all_radar_images()
-                if newest_in_seq:
-                    newest_ts = newest_in_seq[-1][0]
-                    newest_age = int((time.time() - newest_ts) / 60)
-                    print(f"  [DATA] Loaded 12-frame sequence  "
-                          f"(newest frame: {datetime.fromtimestamp(newest_ts).strftime('%H:%M:%S')}, "
-                          f"{newest_age}m ago)", flush=True)
+                # Validate the 12-frame input using 5-minute slot analysis.
+                # Divide the last 65 minutes into 12 slots (each ~5 min wide),
+                # working backward from now. A slot counts as filled if at least
+                # one radar image falls within it. Allow at most 1 empty slot.
+                now = int(time.time())
+                all_images = data_manager.get_all_radar_images()
 
-                # Check for duplicate consecutive frames — indicates a stuck radar source.
-                # More than 1 duplicate in the 12-frame window means the input is
-                # unreliable and the prediction should be skipped.
-                frames = sequence[0]  # (12, 512, 512, 3)
-                duplicate_count = sum(
-                    1 for i in range(1, len(frames))
-                    if np.array_equal(frames[i], frames[i - 1])
-                )
-                if duplicate_count > 1:
+                filled_slots = 0
+                missing_slot_times = []  # human-readable times for empty slots
+                slot_images = []  # best image per slot (for building sequence)
+                for slot_idx in range(12):
+                    slot_end = now - slot_idx * 5 * 60
+                    slot_start = slot_end - 5 * 60
+                    candidates = [img for img in all_images
+                                  if slot_start < img[0] <= slot_end]
+                    if candidates:
+                        filled_slots += 1
+                        # Pick the one closest to the slot centre
+                        slot_centre = (slot_start + slot_end) / 2
+                        best = min(candidates, key=lambda x: abs(x[0] - slot_centre))
+                        slot_images.append(best)
+                    else:
+                        slot_images.append(None)
+                        # Label with the slot's expected time (its end boundary)
+                        missing_slot_times.append(
+                            datetime.fromtimestamp(slot_end).strftime("%H:%M"))
+
+                # slot_images[0] is the newest slot, [11] is the oldest.
+                # Reverse so index 0 = oldest (chronological order for the model).
+                slot_images.reverse()
+                empty_slots = 12 - filled_slots
+
+                if empty_slots > 1:
                     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"\n[{timestamp_str}] [WARNING] Sequence has {duplicate_count} duplicate "
-                          f"consecutive frame(s) — radar source appears stuck. Skipping prediction.",
-                          flush=True)
-                    frames_needed = duplicate_count - 1
+                    print(f"\n[{timestamp_str}] [WARNING] Only {filled_slots}/12 time slots "
+                          f"filled in the last hour ({empty_slots} empty) — need at least 11. "
+                          f"Missing: {', '.join(missing_slot_times)}. "
+                          f"Skipping prediction.", flush=True)
                     _write_predictor_status(
                         "stuck",
-                        duplicate_count=duplicate_count,
-                        frames_needed=frames_needed,
-                        eta_minutes=frames_needed * 5,
+                        frames_available=filled_slots,
+                        frames_needed=empty_slots - 1,
+                        eta_minutes=(empty_slots - 1) * 5,
+                        missing_slots=missing_slot_times,
                     )
                     made_prediction = False
                 else:
+                    # Fill any single gap by duplicating the nearest neighbour
+                    for i in range(12):
+                        if slot_images[i] is None:
+                            # Find nearest filled slot
+                            neighbour = None
+                            for offset in range(1, 12):
+                                if i + offset < 12 and slot_images[i + offset] is not None:
+                                    neighbour = slot_images[i + offset]
+                                    break
+                                if i - offset >= 0 and slot_images[i - offset] is not None:
+                                    neighbour = slot_images[i - offset]
+                                    break
+                            slot_images[i] = neighbour
+
+                    seq_images = [img for img in slot_images if img is not None]
+
+                    if len(seq_images) < 12:
+                        # Shouldn't happen, but guard against it
+                        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"\n[{timestamp_str}] [WARNING] Could not build 12-frame sequence "
+                              f"after gap-filling. Skipping.", flush=True)
+                        made_prediction = False
+                    else:
+                        newest_ts = seq_images[-1][0]
+                        newest_age = int((time.time() - newest_ts) / 60)
+                        gap_note = " (1 slot gap-filled)" if empty_slots == 1 else ""
+                        print(f"  [DATA] Loaded 12-frame sequence from last hour{gap_note}  "
+                              f"(newest frame: {datetime.fromtimestamp(newest_ts).strftime('%H:%M:%S')}, "
+                              f"{newest_age}m ago)", flush=True)
+
+                        input_sequence = []
+                        for img_info in seq_images:
+                            input_sequence.append(data_manager.load_image(img_info[1]))
+                        sequence = np.array([input_sequence], dtype=np.float32)
+                        del input_sequence
+                        made_prediction = None  # will be set below
+
+                if made_prediction is False:
+                    pass  # skip to evaluation
+                elif made_prediction is None:
                     # Make 5 predictions recursively
                     _write_predictor_status("predicting")
                     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -495,33 +539,38 @@ def continuous_learning():
                     
                     actual_frames = []
                     frame_metrics = []
-                    eval_skipped = False
+                    skipped_frames = []
                     
                     for frame_num in range(5):
                         # Find actual image for this frame
                         target_time = pred_timestamp + (frame_num + 1) * 5 * 60
                         actual_image = min(images, key=lambda x: abs(x[0] - target_time))
                         
-                        # Reject if the closest frame is more than 3 minutes off
                         time_off = abs(actual_image[0] - target_time)
-                        if time_off > 3 * 60:
-                            print(f"  [WARNING] Frame {frame_num+1}: nearest actual is {time_off}s off target — skipping evaluation")
-                            eval_skipped = True
-                            break
-                        
-                        # Load the actual image
-                        actual = data_manager.load_image(actual_image[1])
-                        actual_frames.append(actual)
-                        
-                        # Calculate metrics
-                        metrics = calculate_image_metrics(pred_frames[frame_num], actual)
-                        frame_metrics.append(metrics)
+                        if time_off > 5 * 60:
+                            # No frame within 5 minutes of target — skip this individual frame
+                            print(f"  [EVAL] Frame {frame_num+1}: nearest actual is {time_off}s off target "
+                                  f"(>{5*60}s) — skipping this frame", flush=True)
+                            skipped_frames.append(frame_num)
+                            # Use grey placeholder for the comparison GIF
+                            actual_frames.append(None)
+                            frame_metrics.append(None)
+                        else:
+                            if time_off > 3 * 60:
+                                print(f"  [EVAL] Frame {frame_num+1}: nearest actual is {time_off}s off target "
+                                      f"(using best available)", flush=True)
+                            actual = data_manager.load_image(actual_image[1])
+                            actual_frames.append(actual)
+                            metrics = calculate_image_metrics(pred_frames[frame_num], actual)
+                            frame_metrics.append(metrics)
                     
-                    if eval_skipped:
-                        print(f"  [WARNING] Missing actual frames — skipping this evaluation")
+                    # Count how many frames we got
+                    valid_metrics = [m for m in frame_metrics if m is not None]
+                    
+                    if len(valid_metrics) == 0:
+                        # No usable frames at all
+                        print(f"  [WARNING] All 5 actual frames missing — skipping evaluation")
                         pending_predictions.remove(pred_timestamp)
-                        # Write a minimal metrics file so the prediction still shows
-                        # in the web UI history (without accuracy numbers).
                         try:
                             metrics_file = f"data/predictions/metrics_{pred_timestamp}.json"
                             with open(metrics_file, 'w') as f:
@@ -532,44 +581,61 @@ def continuous_learning():
                         gc.collect()
                         continue
                     
-                    # Calculate averages
-                    avg_mse = sum(m['mse'] for m in frame_metrics) / len(frame_metrics)
-                    avg_mae = sum(m['mae'] for m in frame_metrics) / len(frame_metrics)
-                    avg_psnr = sum(m['psnr'] for m in frame_metrics) / len(frame_metrics)
+                    if skipped_frames:
+                        print(f"  [EVAL] {len(skipped_frames)} frame(s) skipped, "
+                              f"evaluating with {len(valid_metrics)}/5 frames", flush=True)
+                    
+                    # Calculate averages (only over valid frames)
+                    avg_mse = sum(m['mse'] for m in valid_metrics) / len(valid_metrics)
+                    avg_mae = sum(m['mae'] for m in valid_metrics) / len(valid_metrics)
+                    avg_psnr = sum(m['psnr'] for m in valid_metrics) / len(valid_metrics)
                     
                     print(f"  Avg MSE: {avg_mse:.6f}, MAE: {avg_mae:.6f}, PSNR: {avg_psnr:.2f} dB")
                     
-                    # Save metrics
+                    # Save metrics (None entries for skipped frames become null in JSON)
                     all_metrics = {
-                        'frames': frame_metrics,
+                        'frames': [m if m is not None else {'skipped': True} for m in frame_metrics],
                         'average': {
                             'mse': avg_mse,
                             'mae': avg_mae,
                             'psnr': avg_psnr
-                        }
+                        },
+                        'evaluated_frames': len(valid_metrics),
+                        'total_frames': 5
                     }
                     metrics_file = f"data/predictions/metrics_{pred_timestamp}.json"
                     with open(metrics_file, 'w') as f:
                         json.dump(all_metrics, f, indent=2)
                     
+                    # Build actual frames list for comparison GIF, using grey
+                    # placeholders for any skipped frames.
+                    actual_for_gif = []
+                    for af in actual_frames:
+                        if af is not None:
+                            actual_for_gif.append(af)
+                        else:
+                            actual_for_gif.append(np.full((512, 512, 3), 100.0/255.0, dtype=np.float32))
+
                     # Update comparison animation with actual data
                     animation_file = create_animated_comparison(
-                        pred_frames, actual_frames, pred_timestamp
+                        pred_frames, actual_for_gif, pred_timestamp
                     )
                     
                     # Create static comparison for backward compatibility
+                    # Use the first valid actual frame
+                    first_actual = next((af for af in actual_frames if af is not None), actual_for_gif[0])
                     comparison_file = save_prediction_comparison(
-                        pred_frames[0], actual_frames[0], pred_timestamp
+                        pred_frames[0], first_actual, pred_timestamp
                     )
                     
                     print(f"  [SUCCESS] Comparison updated with actual data: {animation_file}")
                     successful_evals += 1
                     
-                    # Update model with first frame — use the same 12-frame input
-                    # the model saw at prediction time, NOT the current latest frames
+                    # Update model with first available actual frame
+                    first_valid_actual = next((af for af in actual_frames if af is not None), None)
                     new_sequence = data_manager.get_sequence_before_timestamp(pred_timestamp, min_timestamp=fresh_cutoff)
-                    if new_sequence is not None:
-                        target = np.expand_dims(actual_frames[0], axis=0)
+                    if new_sequence is not None and first_valid_actual is not None:
+                        target = np.expand_dims(first_valid_actual, axis=0)
                         try:
                             result = model.train_on_batch(new_sequence, target)
                             loss_value = result[0] if isinstance(result, list) else result

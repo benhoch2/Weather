@@ -385,9 +385,26 @@ def prediction_status():
 @app.route('/api/radar_health')
 def radar_health():
     """
-    Return predictor health from the status file written by predict_continuous.py.
+    Return predictor health from the status file written by predict_continuous.py,
+    plus fetcher duplicate info from fetcher_status.json.
     Falls back to OK if the status file is absent or stale (>15 min old).
     """
+    result = {'stuck': False, 'duplicate_count': 0, 'frames_available': None,
+              'frames_needed': 0, 'eta_minutes': 0, 'message': 'OK',
+              'last_duplicate_slot': None, 'missing_slots': []}
+
+    # ── Fetcher duplicate info ──
+    fetcher_file = Path("data/fetcher_status.json")
+    if fetcher_file.exists():
+        try:
+            fdata = json.loads(fetcher_file.read_text())
+            age_s = int(time.time()) - fdata.get("updated_at", 0)
+            if age_s <= 600 and fdata.get("duplicate"):
+                result['last_duplicate_slot'] = fdata.get("last_slot_str")
+        except Exception:
+            pass
+
+    # ── Predictor stuck info ──
     status_file = Path("data/predictor_status.json")
     if status_file.exists():
         try:
@@ -396,21 +413,32 @@ def radar_health():
             # Treat status as expired after 15 min (3 prediction cycles missed)
             if age_s <= 900 and data.get("status") == "stuck":
                 dup = data.get("duplicate_count", 0)
+                available = data.get("frames_available")
                 needed = data.get("frames_needed", max(0, dup - 1))
                 eta = data.get("eta_minutes", needed * 5)
-                return jsonify({
+                if available is not None:
+                    msg = (
+                        f'Only {available} frame(s) in the last hour — '
+                        f'{needed} more needed (~{eta} min)'
+                    )
+                else:
+                    msg = (
+                        f'Radar source appears stuck — '
+                        f'{needed} more unique frame(s) needed (~{eta} min)'
+                    )
+                result.update({
                     'stuck': True,
                     'duplicate_count': dup,
+                    'frames_available': available,
                     'frames_needed': needed,
                     'eta_minutes': eta,
-                    'message': (
-                        f'{dup} duplicate frame(s) in sequence \u2014 '
-                        f'{needed} more unique frame(s) needed (~{eta} min)'
-                    ),
+                    'message': msg,
+                    'missing_slots': data.get('missing_slots', []),
                 })
         except Exception:
             pass
-    return jsonify({'stuck': False, 'duplicate_count': 0, 'frames_needed': 0, 'eta_minutes': 0, 'message': 'OK'})
+
+    return jsonify(result)
 
 @app.route('/api/readiness')
 def get_readiness():

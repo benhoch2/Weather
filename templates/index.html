@@ -339,11 +339,12 @@
             <div style="display:flex; align-items:center; gap:12px;">
                 <span style="font-size:1.8em;">&#9888;&#65039;</span>
                 <div style="flex:1;">
-                    <strong style="color:#856404; font-size:1.1em;">Radar Source Stuck &mdash; Predictions Paused</strong>
-                    <p style="color:#856404; margin-top:4px; font-size:0.95em;" id="stuck-radar-message">The radar site appears to be returning the same image repeatedly.</p>
+                    <strong style="color:#856404; font-size:1.1em;">Not Enough Recent Frames &mdash; Predictions Paused</strong>
+                    <p style="color:#856404; margin-top:4px; font-size:0.95em;" id="stuck-radar-message">Insufficient radar captures in the last hour to build a reliable 12-frame input.</p>
                     <div id="stuck-radar-detail" style="margin-top:8px; display:flex; gap:24px; flex-wrap:wrap;">
                         <span style="background:#ffc107; color:#533f03; border-radius:8px; padding:3px 12px; font-size:0.88em; font-weight:bold;" id="stuck-frames-badge"></span>
                         <span style="background:#856404; color:#fff; border-radius:8px; padding:3px 12px; font-size:0.88em; font-weight:bold;" id="stuck-eta-badge"></span>
+                        <span style="display:none; background:#dc3545; color:#fff; border-radius:8px; padding:3px 12px; font-size:0.88em; font-weight:bold;" id="stuck-dup-badge"></span>
                     </div>
                 </div>
             </div>
@@ -665,12 +666,22 @@
                 const msg = document.getElementById('stuck-radar-message');
                 const framesBadge = document.getElementById('stuck-frames-badge');
                 const etaBadge = document.getElementById('stuck-eta-badge');
+                const dupBadge = document.getElementById('stuck-dup-badge');
                 if (data.stuck) {
-                    const dup = data.duplicate_count || 0;
+                    const available = data.frames_available;
                     const needed = data.frames_needed || 0;
                     const eta = data.eta_minutes || 0;
-                    msg.textContent = `${dup} duplicate consecutive frame(s) in the 12-frame sequence — predictions are being skipped.`;
-                    framesBadge.textContent = `${needed} unique frame(s) needed to resume`;
+                    if (available !== null && available !== undefined) {
+                        msg.textContent = `Only ${available}/12 time slots filled in the last hour (need at least 11) — predictions are paused.`;
+                    } else {
+                        msg.textContent = `Radar source appears stuck — predictions are paused.`;
+                    }
+                    const missing = data.missing_slots || [];
+                    if (missing.length > 0) {
+                        framesBadge.textContent = `Missing: ${missing.join(', ')}`;
+                    } else {
+                        framesBadge.textContent = `${needed} more slot(s) needed to resume`;
+                    }
                     // Compute absolute ETA clock time
                     const etaTime = new Date(Date.now() + eta * 60 * 1000);
                     const hh = etaTime.getHours().toString().padStart(2, '0');
@@ -679,6 +690,20 @@
                     banner.style.display = 'block';
                 } else {
                     banner.style.display = 'none';
+                }
+                // Show latest duplicate slot if present
+                if (data.last_duplicate_slot) {
+                    dupBadge.textContent = `Last duplicate: ${data.last_duplicate_slot} (image lost)`;
+                    dupBadge.style.display = 'inline';
+                    // Also show banner even when not stuck, so user sees the duplicate
+                    if (!data.stuck) {
+                        banner.style.display = 'block';
+                        msg.textContent = 'Radar source returned a duplicate image — frame was discarded.';
+                        framesBadge.textContent = '';
+                        etaBadge.textContent = '';
+                    }
+                } else {
+                    dupBadge.style.display = 'none';
                 }
             } catch (error) {
                 console.error('Error loading radar health:', error);
