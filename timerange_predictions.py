@@ -184,7 +184,7 @@ def process_sequences():
         })
     
     print()
-    print(f"✓ Completed processing {len(results)} sequences")
+    print(f"[OK] Completed processing {len(results)} sequences")
     print()
     processing_complete = True
     return True
@@ -194,9 +194,9 @@ def index():
     """Display all predictions with auto-refresh."""
     status_msg = ""
     if processing_complete:
-        status_msg = f"✓ Processing complete - Showing all {len(results)} predictions"
+        status_msg = f"[OK] Processing complete - Showing all {len(results)} predictions"
     else:
-        status_msg = f"⏳ Processing... {current_sequence}/{total_sequences} sequences completed"
+        status_msg = f"[...] Processing... {current_sequence}/{total_sequences} sequences completed"
     
     html = f"""
     <!DOCTYPE html>

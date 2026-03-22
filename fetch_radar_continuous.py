@@ -2,11 +2,56 @@ import requests
 from PIL import Image
 from io import BytesIO
 import time
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 import os
 
 DEFAULT_MAX_STORED_IMAGES = 0
+
+# ── Duplicate-process guard ──────────────────────────────────────────────────
+FETCHER_LOCK = Path(__file__).parent / "fetcher.lock"
+
+
+def _is_pid_running(pid: int) -> bool:
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if str(pid) in line and "python" in line.lower():
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def acquire_fetcher_lock() -> None:
+    if FETCHER_LOCK.exists():
+        try:
+            pid = int(FETCHER_LOCK.read_text().strip())
+            if _is_pid_running(pid):
+                print(f"[FETCHER] ERROR: A radar fetcher is already running (PID {pid}).")
+                print(f"[FETCHER]   Stop it first, or delete {FETCHER_LOCK} if it is stale.")
+                sys.exit(1)
+            else:
+                print(f"[FETCHER] Cleaning stale lock (PID {pid} is gone)")
+                FETCHER_LOCK.unlink(missing_ok=True)
+        except (ValueError, SystemExit):
+            raise
+        except Exception:
+            FETCHER_LOCK.unlink(missing_ok=True)
+    FETCHER_LOCK.write_text(str(os.getpid()))
+    print(f"[FETCHER] Lock acquired (PID {os.getpid()})")
+
+
+def release_fetcher_lock() -> None:
+    try:
+        FETCHER_LOCK.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 def fetch_radar_image():
     """
@@ -41,7 +86,7 @@ def fetch_radar_image():
         
         # Save the image
         img.save(filename)
-        print(f"  ✓ Saved as: {filename}")
+        print(f"  [OK] Saved as: {filename}")
         
         # Clean up old images - keep only last 12
         cleanup_old_images()
@@ -49,10 +94,10 @@ def fetch_radar_image():
         return filename
             
     except requests.exceptions.RequestException as e:
-        print(f"  ✗ Error fetching radar data: {e}")
+        print(f"  [ERROR] Error fetching radar data: {e}")
         return None
     except Exception as e:
-        print(f"  ✗ Error processing image: {e}")
+        print(f"  [ERROR] Error processing image: {e}")
         return None
 
 def cleanup_old_images():
@@ -92,33 +137,51 @@ def main():
     """
     Continuously fetch radar images every 5 minutes.
     """
+    acquire_fetcher_lock()
+
     print("=" * 60)
     print("Weather Radar Image Fetcher")
     print("Fetching radar images every 5 minutes")
     print("Press Ctrl+C to stop")
     print("=" * 60)
     print()
-    
+
+    # Count how many images are already stored so the predictor can see the corpus size
+    existing = sorted(Path("data/radar_images").glob("radar_*.png"))
+    print(f"[FETCHER] Found {len(existing)} existing radar image(s) on disk")
+    if existing:
+        newest_ts = int(existing[-1].stem.split('_')[1])
+        print(f"[FETCHER] Newest stored image: {datetime.fromtimestamp(newest_ts).strftime('%Y-%m-%d %H:%M:%S')}")
+    print()
+
     interval_seconds = 5 * 60  # 5 minutes
-    
+
     try:
         while True:
-            # Fetch the image
-            fetch_radar_image()
-            
-            # Wait for 5 minutes
+            fetch_start = time.time()
+            result = fetch_radar_image()
+            fetch_elapsed = time.time() - fetch_start
+
+            if result:
+                total = len(list(Path("data/radar_images").glob("radar_*.png")))
+                print(f"  [FETCHER] Stored {total} image(s) total  (fetch took {fetch_elapsed:.1f}s)")
+            else:
+                print(f"  [FETCHER] Fetch failed — will retry at next interval")
+
             next_fetch = datetime.now().timestamp() + interval_seconds
             next_fetch_time = datetime.fromtimestamp(next_fetch).strftime("%Y-%m-%d %H:%M:%S")
             print(f"  Next fetch at: {next_fetch_time}")
             print()
-            
+
             time.sleep(interval_seconds)
-            
+
     except KeyboardInterrupt:
         print("\n")
         print("=" * 60)
         print("Stopped by user. Goodbye!")
         print("=" * 60)
+    finally:
+        release_fetcher_lock()
 
 if __name__ == "__main__":
     main()

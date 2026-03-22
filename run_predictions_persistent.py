@@ -4,9 +4,57 @@ Logs all errors to help debug issues.
 """
 import subprocess
 import sys
+import os
 import time
 from datetime import datetime
 from pathlib import Path
+
+# ── Duplicate-process guard ───────────────────────────────────────────────────
+# If another instance of this script is already running, refuse to start.
+# This prevents the "two predictors eating each other's history" bug.
+
+PREDICTOR_LOCK = Path(__file__).parent / "predictor.lock"
+
+
+def _is_pid_running(pid: int) -> bool:
+    """Return True when a **Python** process with this PID is alive."""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if str(pid) in line and "python" in line.lower():
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def acquire_predictor_lock() -> None:
+    if PREDICTOR_LOCK.exists():
+        try:
+            pid = int(PREDICTOR_LOCK.read_text().strip())
+            if _is_pid_running(pid):
+                print(f"[PERSISTENT] ERROR: A prediction engine is already running (PID {pid}).")
+                print(f"[PERSISTENT]   Stop it first, or delete {PREDICTOR_LOCK} if it is stale.")
+                sys.exit(1)
+            else:
+                print(f"[PERSISTENT] Cleaning stale lock (PID {pid} is gone)")
+                PREDICTOR_LOCK.unlink(missing_ok=True)
+        except (ValueError, SystemExit):
+            raise
+        except Exception:
+            PREDICTOR_LOCK.unlink(missing_ok=True)  # Unreadable — remove
+    PREDICTOR_LOCK.write_text(str(os.getpid()))
+    print(f"[PERSISTENT] Lock acquired (PID {os.getpid()})")
+
+
+def release_predictor_lock() -> None:
+    try:
+        PREDICTOR_LOCK.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 log_file = Path("prediction_errors.log")
 
@@ -21,7 +69,7 @@ def log_message(message):
 def run_predictions():
     """Run the prediction script and restart on failure."""
     restart_count = 0
-    
+
     log_message("=" * 70)
     log_message("Prediction Persistent Runner Started")
     log_message("Will automatically restart on crashes")
@@ -32,13 +80,14 @@ def run_predictions():
             restart_count += 1
             log_message(f"\nStarting predict_continuous.py (attempt #{restart_count})")
             
-            # Run the prediction script
+            # Run the prediction script with -u for unbuffered output
             process = subprocess.Popen(
-                [sys.executable, "predict_continuous.py"],
+                [sys.executable, "-u", "predict_continuous.py"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1
+                bufsize=1,
+                env={**__import__('os').environ, "PYTHONUNBUFFERED": "1", "TF_ENABLE_ONEDNN_OPTS": "0"}
             )
             
             # Stream output in real-time
@@ -49,7 +98,7 @@ def run_predictions():
             return_code = process.wait()
             
             if return_code != 0:
-                log_message(f"⚠️  Process exited with code {return_code}")
+                log_message(f"[WARNING] Process exited with code {return_code}")
             else:
                 log_message("Process exited normally")
                 
@@ -60,7 +109,7 @@ def run_predictions():
             break
             
         except Exception as e:
-            log_message(f"⚠️  ERROR: {type(e).__name__}: {e}")
+            log_message(f"[ERROR] {type(e).__name__}: {e}")
             import traceback
             log_message(traceback.format_exc())
         
@@ -70,4 +119,8 @@ def run_predictions():
         time.sleep(wait_time)
 
 if __name__ == "__main__":
-    run_predictions()
+    acquire_predictor_lock()
+    try:
+        run_predictions()
+    finally:
+        release_predictor_lock()

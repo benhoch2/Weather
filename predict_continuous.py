@@ -1,3 +1,12 @@
+import os
+# Disable oneDNN/MKL optimizations: with them enabled, TF uses the mklcpu
+# allocator which can OOM mid-operation and then hit a C++ dtype CHECK failure,
+# crashing the process with an unrecoverable abort. Without oneDNN, TF's own
+# BFC allocator handles OOM by raising a Python ResourceExhaustedError instead.
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+import sys
+import gc
 import numpy as np
 from PIL import Image
 import time
@@ -98,15 +107,19 @@ def create_animated_comparison(predicted_frames, actual_frames, timestamp):
     )
     return filename
 
-def cleanup_old_predictions():
+def cleanup_old_predictions(pending_timestamps=None):
     """
     Keep only the last 10 predictions, delete older ones.
     This includes metrics JSON files, comparison GIFs, prediction-only GIFs, and all frame images.
+    Predictions still pending evaluation are always protected from deletion.
     """
     try:
         predictions_dir = Path("data/predictions")
         if not predictions_dir.exists():
             return
+        
+        # Timestamps that must never be deleted (pending evaluation)
+        protected = set(str(ts) for ts in (pending_timestamps or []))
         
         # Get all prediction animations sorted by timestamp (newest first)
         animations = sorted(
@@ -115,20 +128,25 @@ def cleanup_old_predictions():
             reverse=True
         )
         
-        # Keep only the 10 most recent timestamps
-        if len(animations) > 10:
+        # Keep only the 20 most recent timestamps
+        if len(animations) > 20:
             keep_timestamps = set()
-            for anim in animations[:10]:
+            for anim in animations[:20]:
                 timestamp = anim.stem.split('_')[-1]
                 keep_timestamps.add(timestamp)
+            
+            # Always protect pending predictions
+            keep_timestamps |= protected
             
             # Delete ALL files not associated with the kept timestamps
             deleted_count = 0
             
             # Delete old prediction animations
-            for anim in animations[10:]:
-                anim.unlink()
-                deleted_count += 1
+            for anim in animations[20:]:
+                ts = anim.stem.split('_')[-1]
+                if ts not in keep_timestamps:
+                    anim.unlink()
+                    deleted_count += 1
             
             # Delete all prediction_only GIFs (not needed for web viewer)
             for pred_only in predictions_dir.glob("prediction_only_*.gif"):
@@ -190,9 +208,11 @@ def continuous_learning():
     run_start_str = datetime.fromtimestamp(run_start_timestamp).strftime("%Y-%m-%d %H:%M:%S")
     
     # Initialize
+    print("Initializing data manager...", flush=True)
     data_manager = RadarDataManager(data_dir="data/radar_images")
     model = RadarPredictionModel()
     
+    print("Loading model...", flush=True)
     # Try to load existing model
     if not model.load('radar_model.keras'):
         print("No trained model found!")
@@ -206,8 +226,8 @@ def continuous_learning():
         model.save('radar_model.keras')
     
     print()
-    print("Model loaded and ready.")
-    print("Making predictions every 5 minutes...")
+    print("Model loaded and ready.", flush=True)
+    print("Making predictions every 5 minutes...", flush=True)
     print("Each prediction covers next 25 minutes (5 frames)")
     print(f"Waiting for 12 new frames captured after: {run_start_str}")
     print("Press Ctrl+C to stop")
@@ -215,11 +235,12 @@ def continuous_learning():
     print("-" * 70)
     
     prediction_count = 0
-    pending_predictions = []  # List of (timestamp, predicted_frames) tuples
+    pending_predictions = []  # List of prediction timestamps (frames stored on disk)
     
     try:
         while True:
             try:
+                cycle_start = time.time()
                 # Only predict once this run has accumulated a full fresh window.
                 sequence = data_manager.get_latest_sequence(min_timestamp=fresh_cutoff)
                 
@@ -232,36 +253,49 @@ def continuous_learning():
                     )
                     time.sleep(60)  # Check every minute
                     continue
-                
+
+                # Log what was loaded so data pipeline issues are easy to spot
+                newest_in_seq = data_manager.get_all_radar_images()
+                if newest_in_seq:
+                    newest_ts = newest_in_seq[-1][0]
+                    newest_age = int((time.time() - newest_ts) / 60)
+                    print(f"  [DATA] Loaded 12-frame sequence  "
+                          f"(newest frame: {datetime.fromtimestamp(newest_ts).strftime('%H:%M:%S')}, "
+                          f"{newest_age}m ago)", flush=True)
+
                 # Make 5 predictions recursively
                 timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"\n[{timestamp_str}] Making 5-frame prediction #{prediction_count + 1}...")
                 
                 prediction_timestamp = int(time.time())
-                predicted_frames = []
+                predicted_frames_pil = []
                 current_sequence = sequence.copy()
                 
                 for frame_num in range(5):
                     # Predict next frame
+                    _frame_t = time.time()
+                    print(f"  [PREDICT] Frame {frame_num+1}/5...", end=" ", flush=True)
                     prediction = model.predict(current_sequence)
-                    predicted_frames.append(prediction)
-                    
+                    print(f"done ({time.time()-_frame_t:.1f}s)", flush=True)
+
+                    # Save individual frame to disk immediately
+                    pred_filename = f"data/predictions/predicted_{prediction_timestamp}_frame{frame_num+1}.png"
+                    pred_img = (prediction * 255).astype(np.uint8)
+                    pred_pil = Image.fromarray(pred_img)
+                    pred_pil.save(pred_filename)
+                    predicted_frames_pil.append(pred_pil)
+
                     # Update sequence for next prediction: remove oldest, add prediction
                     new_frame = np.expand_dims(prediction, axis=0)  # (1, 512, 512, 3)
                     new_frame = np.expand_dims(new_frame, axis=1)   # (1, 1, 512, 512, 3)
                     current_sequence = np.concatenate([current_sequence[:, 1:, :, :, :], new_frame], axis=1)
+                    del prediction, pred_img, new_frame
                 
-                # Save individual frames
-                for frame_num, pred_frame in enumerate(predicted_frames):
-                    pred_filename = f"data/predictions/predicted_{prediction_timestamp}_frame{frame_num+1}.png"
-                    pred_img = (pred_frame * 255).astype(np.uint8)
-                    Image.fromarray(pred_img).save(pred_filename)
+                # Free the large sequence arrays
+                del current_sequence, sequence
                 
                 # Create prediction-only animated GIF
-                prediction_frames_pil = []
-                for pred_frame in predicted_frames:
-                    pred_img = (pred_frame * 255).astype(np.uint8)
-                    prediction_frames_pil.append(Image.fromarray(pred_img))
+                prediction_frames_pil = predicted_frames_pil
                 
                 pred_only_filename = f"data/predictions/prediction_only_{prediction_timestamp}.gif"
                 prediction_frames_pil[0].save(
@@ -274,10 +308,7 @@ def continuous_learning():
                 
                 # Create immediate "preview" comparison GIF (prediction-only, will be replaced later)
                 comparison_preview_frames = []
-                for pred_frame in predicted_frames:
-                    pred_img = (pred_frame * 255).astype(np.uint8)
-                    pred_pil = Image.fromarray(pred_img)
-                    
+                for pred_pil in prediction_frames_pil:
                     # Create placeholder - just show prediction on left, gray placeholder on right
                     placeholder = Image.new('RGB', (512, 512), color=(100, 100, 100))
                     comparison = Image.new('RGB', (pred_pil.width * 2, pred_pil.height))
@@ -309,20 +340,42 @@ def continuous_learning():
                 print(f"  Prediction animation: {pred_only_filename}")
                 print(f"  Preview comparison: {preview_filename} (will update with actual in 25 min)")
                 
-                # Add to pending predictions
-                pending_predictions.append((prediction_timestamp, predicted_frames))
+                # Add to pending predictions (only timestamp, frames are on disk)
+                pending_predictions.append(prediction_timestamp)
+                
+                # Free PIL frames
+                del prediction_frames_pil, predicted_frames_pil, comparison_preview_frames
+                gc.collect()
                 
                 # Clean up old files - run every cycle to keep disk usage minimal
-                cleanup_old_predictions()
+                cleanup_old_predictions(pending_timestamps=pending_predictions)
                 
                 # Check if any predictions are ready to be evaluated (25 minutes old)
                 current_time = int(time.time())
-                ready_predictions = [(ts, frames) for ts, frames in pending_predictions 
+                ready_predictions = [ts for ts in pending_predictions 
                                     if current_time >= ts + 25 * 60]
                 
                 # Evaluate ready predictions
-                for pred_timestamp, pred_frames in ready_predictions:
+                for pred_timestamp in ready_predictions:
                     print(f"\n  Evaluating prediction from {datetime.fromtimestamp(pred_timestamp).strftime('%H:%M:%S')}...")
+                    
+                    # Reload predicted frames from disk
+                    print(f"  [EVAL] Loading 5 predicted frames from disk...", flush=True)
+                    pred_frames = []
+                    frames_found = True
+                    for frame_num in range(5):
+                        pred_path = Path(f"data/predictions/predicted_{pred_timestamp}_frame{frame_num+1}.png")
+                        if not pred_path.exists():
+                            print(f"  [WARNING] Missing predicted frame: {pred_path.name}, skipping evaluation")
+                            frames_found = False
+                            break
+                        pred_frames.append(data_manager.load_image(pred_path))
+                    if frames_found:
+                        print(f"  [EVAL] Frames loaded OK", flush=True)
+                    
+                    if not frames_found:
+                        pending_predictions.remove(pred_timestamp)
+                        continue
                     
                     # Get actual images
                     images = data_manager.get_all_radar_images()
@@ -378,23 +431,39 @@ def continuous_learning():
                     print(f"  [SUCCESS] Comparison updated with actual data: {animation_file}")
                     
                     # Update model with first frame
-                    new_sequence = data_manager.get_latest_sequence()
+                    new_sequence = data_manager.get_latest_sequence(min_timestamp=fresh_cutoff)
                     if new_sequence is not None:
                         target = np.expand_dims(actual_frames[0], axis=0)
-                        result = model.train_on_batch(new_sequence, target)
-                        loss_value = result[0] if isinstance(result, list) else result
-                        print(f"  Model updated - Loss: {loss_value:.6f}")
+                        try:
+                            result = model.train_on_batch(new_sequence, target)
+                            loss_value = result[0] if isinstance(result, list) else result
+                            print(f"  Model updated - Loss: {loss_value:.6f}")
+                        except Exception as train_err:
+                            print(f"  [WARNING] Skipping model update (training failed: {train_err})")
+                        del new_sequence, target
+                    
+                    # Free evaluation arrays
+                    del pred_frames, actual_frames
+                    gc.collect()
                     
                     # Remove from pending
-                    pending_predictions.remove((pred_timestamp, pred_frames))
+                    pending_predictions.remove(pred_timestamp)
                 
                 prediction_count += 1
                 print(f"\n  Total predictions: {prediction_count}")
                 print(f"  Pending evaluations: {len(pending_predictions)}")
                 print("-" * 70)
                 
-                # Wait 5 minutes before next prediction
-                time.sleep(5 * 60)
+                # Sleep only the remaining time to keep a strict 5-minute cycle
+                elapsed = time.time() - cycle_start
+                sleep_for = max(0, 5 * 60 - elapsed)
+                if sleep_for > 0:
+                    sleep_mins = int(sleep_for // 60)
+                    sleep_secs = int(sleep_for % 60)
+                    print(f"  [SLEEP] Cycle took {elapsed:.0f}s  —  sleeping {sleep_mins}m {sleep_secs:02d}s until next cycle", flush=True)
+                    time.sleep(sleep_for)
+                else:
+                    print(f"  [SLEEP] Cycle took {elapsed:.0f}s  —  no sleep needed (running behind)", flush=True)
                 
             except Exception as e:
                 # Don't crash on individual prediction errors
@@ -402,6 +471,7 @@ def continuous_learning():
                 print(f"  Traceback: {type(e).__name__}")
                 import traceback
                 traceback.print_exc()
+                gc.collect()
                 print(f"  Waiting 60 seconds before retry...")
                 print("-" * 70)
                 time.sleep(60)  # Wait a minute before trying again

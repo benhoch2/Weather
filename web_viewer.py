@@ -18,6 +18,40 @@ prediction_process = None
 prediction_running = False
 prediction_start_time = None
 
+# ── Lock-file helpers (mirrors run_predictions_persistent.py) ─────────────────
+# When the app is launched via start.py the predictor is NOT a child of this
+# web_viewer process, so the globals above never get set.  We check the lock
+# file so all status/start/stop/readiness endpoints work correctly regardless
+# of how the predictor was started.
+
+PREDICTOR_LOCK = Path(__file__).parent / "predictor.lock"
+
+
+def _lock_info():
+    """
+    Return (pid, started_at) from predictor.lock, or (None, None) if absent/stale.
+    started_at is the lock file's modification time (unix timestamp).
+    """
+    try:
+        if not PREDICTOR_LOCK.exists():
+            return None, None
+        pid = int(PREDICTOR_LOCK.read_text().strip())
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # Verify it's actually a python process, not a recycled PID
+        is_python = any(
+            str(pid) in line and "python" in line.lower()
+            for line in result.stdout.splitlines()
+        )
+        if not is_python:
+            return None, None  # Stale lock
+        started_at = int(PREDICTOR_LOCK.stat().st_mtime)
+        return pid, started_at
+    except Exception:
+        return None, None
+
 class PredictionViewer:
     """
     Manages viewing of radar predictions and comparisons.
@@ -254,9 +288,17 @@ def serve_image(filename):
 def start_predictions():
     """Start the prediction process."""
     global prediction_process, prediction_running, prediction_start_time
-    
+
+    # Already running via this web viewer
     if prediction_running and prediction_process and prediction_process.poll() is None:
         return jsonify({'status': 'already_running', 'message': 'Predictions are already running'})
+
+    # Already running externally (e.g. launched by start.py)
+    ext_pid, ext_started = _lock_info()
+    if ext_pid:
+        return jsonify({'status': 'already_running',
+                        'message': f'Prediction engine is already running (PID {ext_pid})',
+                        'pid': ext_pid})
     
     try:
         # Start persistent runner with auto-restart capability.
@@ -281,48 +323,67 @@ def start_predictions():
 def stop_predictions():
     """Stop the prediction process."""
     global prediction_process, prediction_running, prediction_start_time
-    
-    if not prediction_running or not prediction_process:
-        return jsonify({'status': 'not_running', 'message': 'Predictions are not running'})
-    
-    try:
-        if os.name == 'nt':
-            # Windows: Send CTRL_BREAK_EVENT
-            os.kill(prediction_process.pid, signal.CTRL_BREAK_EVENT)
-        else:
-            # Unix: Send SIGTERM
-            prediction_process.terminate()
-        
-        prediction_process.wait(timeout=5)
+
+    # If started by this web viewer, stop it directly
+    if prediction_running and prediction_process:
+        try:
+            if os.name == 'nt':
+                os.kill(prediction_process.pid, signal.CTRL_BREAK_EVENT)
+            else:
+                prediction_process.terminate()
+            prediction_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            prediction_process.kill()
+        except Exception:
+            pass
         prediction_running = False
         prediction_process = None
         prediction_start_time = None
         return jsonify({'status': 'stopped', 'message': 'Prediction process stopped'})
-    except subprocess.TimeoutExpired:
-        # Force kill if it doesn't stop gracefully
-        prediction_process.kill()
-        prediction_running = False
-        prediction_process = None
-        prediction_start_time = None
-        return jsonify({'status': 'force_stopped', 'message': 'Prediction process force stopped'})
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+    # If started externally (start.py), stop via the lock-file PID
+    ext_pid, _ = _lock_info()
+    if ext_pid:
+        try:
+            if os.name == 'nt':
+                subprocess.run(["taskkill", "/PID", str(ext_pid), "/T", "/F"],
+                               capture_output=True, timeout=10)
+            else:
+                os.kill(ext_pid, signal.SIGTERM)
+            # Give it a moment to clean up its own lock file
+            time.sleep(2)
+            # Force-remove stale lock if the process left it behind
+            try:
+                PREDICTOR_LOCK.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return jsonify({'status': 'stopped',
+                            'message': f'External prediction process (PID {ext_pid}) stopped'})
+        except Exception as e:
+            return jsonify({'status': 'error', 'message': str(e)}), 500
+
+    return jsonify({'status': 'not_running', 'message': 'Predictions are not running'})
 
 @app.route('/api/prediction_control/status')
 def prediction_status():
     """Get the status of the prediction process."""
     global prediction_process, prediction_running, prediction_start_time
-    
-    # Check if process is actually running
+
+    # Sync state for process started by this web viewer
     if prediction_process and prediction_process.poll() is not None:
         prediction_running = False
         prediction_process = None
         prediction_start_time = None
-    
-    return jsonify({
-        'running': prediction_running,
-        'pid': prediction_process.pid if prediction_process else None
-    })
+
+    if prediction_running and prediction_process:
+        return jsonify({'running': True, 'pid': prediction_process.pid})
+
+    # Check for predictor started externally (e.g. via start.py)
+    ext_pid, _ = _lock_info()
+    if ext_pid:
+        return jsonify({'running': True, 'pid': ext_pid, 'external': True})
+
+    return jsonify({'running': False, 'pid': None})
 
 @app.route('/api/readiness')
 def get_readiness():
@@ -335,7 +396,18 @@ def get_readiness():
         prediction_process = None
         prediction_start_time = None
 
-    if not prediction_running or prediction_start_time is None:
+    # Determine effective start time: prefer the in-process value, fall back to
+    # the lock file mtime for predictors launched externally by start.py.
+    effective_start = prediction_start_time
+    is_running = prediction_running
+
+    if not is_running:
+        ext_pid, ext_started = _lock_info()
+        if ext_pid:
+            is_running = True
+            effective_start = ext_started
+
+    if not is_running or effective_start is None:
         return jsonify({
             'running': False,
             'frames_since_start': 0,
@@ -350,7 +422,7 @@ def get_readiness():
     # Allow a 1-hour grace window before the predictor started so frames
     # captured by the fetcher just before clicking Start Predictions also count.
     # This still excludes frames that are hours/days/months old.
-    fresh_cutoff = prediction_start_time - 3600
+    fresh_cutoff = effective_start - 3600
     if radar_dir.exists():
         for f in radar_dir.glob('radar_*.png'):
             try:
@@ -370,7 +442,7 @@ def get_readiness():
         'frames_needed': frames_needed,
         'ready': ready,
         'eta_minutes': eta_minutes,
-        'started_at': datetime.fromtimestamp(prediction_start_time).strftime('%Y-%m-%d %H:%M:%S')
+        'started_at': datetime.fromtimestamp(effective_start).strftime('%Y-%m-%d %H:%M:%S')
     })
 
 if __name__ == '__main__':
