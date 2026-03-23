@@ -319,18 +319,19 @@ def continuous_learning():
                 cycle_start = time.time()
 
                 # Validate the 12-frame input using 5-minute slot analysis.
-                # Divide the last 65 minutes into 12 slots (each ~5 min wide),
-                # working backward from now. A slot counts as filled if at least
-                # one radar image falls within it. Allow at most 1 empty slot.
+                # Slots are aligned to wall-clock boundaries (XX:00, XX:05, …)
+                # matching the fetcher's schedule. Need at least 11/12 filled.
                 now = int(time.time())
+                slot_size = 5 * 60
+                latest_slot = (now // slot_size) * slot_size  # e.g. 22:00 when now=22:01:42
                 all_images = data_manager.get_all_radar_images()
 
                 filled_slots = 0
                 missing_slot_times = []  # human-readable times for empty slots
                 slot_images = []  # best image per slot (for building sequence)
                 for slot_idx in range(12):
-                    slot_end = now - slot_idx * 5 * 60
-                    slot_start = slot_end - 5 * 60
+                    slot_end = latest_slot - slot_idx * slot_size
+                    slot_start = slot_end - slot_size
                     candidates = [img for img in all_images
                                   if slot_start < img[0] <= slot_end]
                     if candidates:
@@ -356,11 +357,31 @@ def continuous_learning():
                           f"filled in the last hour ({empty_slots} empty) — need at least 11. "
                           f"Missing: {', '.join(missing_slot_times)}. "
                           f"Skipping prediction.", flush=True)
+                    # Compute ETA: the oldest missing slot will slide out of the
+                    # 12-slot window as newer wall-clock images accumulate.
+                    # Parse the oldest missing slot to determine when it exits.
+                    today = datetime.now().date()
+                    oldest_missing_dt = None
+                    for ms in missing_slot_times:
+                        h, m = map(int, ms.split(':'))
+                        dt = datetime.combine(today, datetime.min.time()).replace(hour=h, minute=m)
+                        if oldest_missing_dt is None or dt < oldest_missing_dt:
+                            oldest_missing_dt = dt
+                    if oldest_missing_dt:
+                        # The slot exits the window 60 min after its boundary
+                        recovery_time = oldest_missing_dt.timestamp() + 3600
+                        eta_min = max(5, int((recovery_time - time.time()) / 60) + 1)
+                    else:
+                        eta_min = (empty_slots - 1) * 5
+                    eta_wall = datetime.fromtimestamp(
+                        ((time.time() + eta_min * 60) // 300 + 1) * 300
+                    ).strftime("%H:%M")
                     _write_predictor_status(
                         "stuck",
                         frames_available=filled_slots,
                         frames_needed=empty_slots - 1,
-                        eta_minutes=(empty_slots - 1) * 5,
+                        eta_minutes=eta_min,
+                        eta_wall=eta_wall,
                         missing_slots=missing_slot_times,
                     )
                     made_prediction = False

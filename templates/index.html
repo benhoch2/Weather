@@ -682,11 +682,15 @@
                     } else {
                         framesBadge.textContent = `${needed} more slot(s) needed to resume`;
                     }
-                    // Compute absolute ETA clock time
-                    const etaTime = new Date(Date.now() + eta * 60 * 1000);
-                    const hh = etaTime.getHours().toString().padStart(2, '0');
-                    const mm = etaTime.getMinutes().toString().padStart(2, '0');
-                    etaBadge.textContent = `Next prediction ~${hh}:${mm} (in ${eta} min)`;
+                    // Use wall-clock ETA from server if available, else compute
+                    if (data.eta_wall) {
+                        etaBadge.textContent = `Next prediction ~${data.eta_wall} (in ~${eta} min)`;
+                    } else {
+                        const etaTime = new Date(Date.now() + eta * 60 * 1000);
+                        const hh = etaTime.getHours().toString().padStart(2, '0');
+                        const mm = etaTime.getMinutes().toString().padStart(2, '0');
+                        etaBadge.textContent = `Next prediction ~${hh}:${mm} (in ~${eta} min)`;
+                    }
                     banner.style.display = 'block';
                 } else {
                     banner.style.display = 'none';

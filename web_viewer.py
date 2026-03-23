@@ -432,6 +432,7 @@ def radar_health():
                     'frames_available': available,
                     'frames_needed': needed,
                     'eta_minutes': eta,
+                    'eta_wall': data.get('eta_wall', ''),
                     'message': msg,
                     'missing_slots': data.get('missing_slots', []),
                 })

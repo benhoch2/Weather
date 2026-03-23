@@ -71,13 +71,16 @@ def fetch_radar_image(slot_ts):
         print(f"  Content-Type: {response.headers.get('Content-Type')}")
         print(f"  Content size: {len(response.content)} bytes")
 
-        # Detect stuck radar source: same bytes as last fetch → skip saving
+        # Duplicate detection disabled — always save so every 5-min slot
+        # has a frame, letting the model learn from static radar too.
         content_hash = hashlib.md5(response.content).hexdigest()
-        if content_hash == _last_content_hash:
-            print(f"  [DUPLICATE] Slot {slot_str} — image identical to previous fetch, skipping save.")
-            _write_fetcher_status(slot_ts, duplicate=True)
-            return None
+        is_duplicate = (content_hash == _last_content_hash)
         _last_content_hash = content_hash
+        if is_duplicate:
+            print(f"  [INFO] Slot {slot_str} — image identical to previous fetch (saving anyway).")
+            _write_fetcher_status(slot_ts, duplicate=True)
+        else:
+            _write_fetcher_status(slot_ts, duplicate=False)
 
         # Open and process the image
         img = Image.open(BytesIO(response.content))
