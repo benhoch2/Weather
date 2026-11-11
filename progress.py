@@ -26,6 +26,20 @@ def bar(done: int, total: int, width: int = 32) -> str:
     return f"[{'#' * fill}{'.' * (width - fill)}] {frac:6.1%}  {done:,}/{total:,}"
 
 
+def queued_stage_b(margin_h: int = 3) -> int | None:
+    """Files stage B will need for the rainy hours the scan has found so far."""
+    from radar_store import RadarStore
+    scan = read_json(config.DATA_DIR / "ims" / "scan.json")
+    if not scan:
+        return None
+    store, wanted = RadarStore(), set()
+    for k, px in scan.items():
+        if px >= config.RAINY_PIXELS:
+            t = int(k)
+            wanted.update(range(t - margin_h * 3600, t + margin_h * 3600 + 1, config.STEP))
+    return sum(1 for t in wanted if not store.has(t) and t not in store.missing)
+
+
 def backfill_section() -> list[str]:
     out = []
     for log in LOGS:
@@ -53,6 +67,11 @@ def backfill_section() -> list[str]:
             eta = f"  ETA {int(m.group(8))} min" if m and done < total else ""
             errs = f"  errors {m.group(7)}" if m and int(m.group(7)) else ""
             out.append(f"  {LABELS.get(stage, stage):<22}{bar(done, total)}{eta}{errs}")
+        if "A" in stages and "B" not in stages and not finished:
+            n = queued_stage_b()
+            if n is not None:
+                out.append(f"  {LABELS['B']:<22}queued: {n:,} files found so far (~{n / 2 / 3600:.1f} h), "
+                           f"more as the scan continues")
     running = any(line.endswith(": running") for line in out)
     if running:   # an idle log while another download runs is just queued behind it
         out = [re.sub(r": idle for \d+ min \(stopped\?\)$", ": paused - resumes after the running download", line)
