@@ -20,7 +20,6 @@ import logging
 import shutil
 import sys
 import time
-from collections import OrderedDict
 
 import numpy as np
 from PIL import Image
@@ -31,7 +30,7 @@ from common import local_str, read_json, setup_logging, write_json
 from ims_source import colorize
 from metrics import Scores
 from model import current_model_path, device, load_checkpoint, predict_mm
-from radar_store import RadarStore
+from radar_store import FrameCache, RadarStore
 
 log = logging.getLogger("predictor")
 STATUS_FILE = config.STATUS_DIR / "predictor.json"
@@ -39,25 +38,6 @@ LEDGER_FILE = config.PRED_DIR / "ledger.jsonl"
 POLL_SECONDS = 30
 OVERLAY_SIZE = 512          # forecast PNGs are upsampled for a smoother map overlay
 EVAL_DEADLINE = config.N_OUT * config.STEP + 30 * 60
-
-
-class FrameCache:
-    """Small LRU cache of decoded grid frames (mm/h)."""
-
-    def __init__(self, store: RadarStore, size: int = 64):
-        self.store, self.size, self._d = store, size, OrderedDict()
-
-    def get(self, t: int) -> np.ndarray | None:
-        if t in self._d:
-            self._d.move_to_end(t)
-            return self._d[t]
-        if not self.store.has(t):
-            return None
-        arr = self.store.load_grid(t)
-        self._d[t] = arr
-        if len(self._d) > self.size:
-            self._d.popitem(last=False)
-        return arr
 
 
 def input_times(t0: int) -> list[int]:

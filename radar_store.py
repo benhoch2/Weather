@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import threading
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -210,6 +212,29 @@ class RadarStore:
 
     def missing_slots(self, t0: int, n_in: int = config.N_IN, n_out: int = 0) -> list[int]:
         return [t for t in self.window_times(t0, n_in, n_out) if not self.has(t)]
+
+
+class FrameCache:
+    """Thread-safe LRU cache of decoded grid frames (mm/h)."""
+
+    def __init__(self, store: RadarStore, size: int = 64):
+        self.store, self.size = store, size
+        self._d: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, t: int) -> np.ndarray | None:
+        with self._lock:
+            if t in self._d:
+                self._d.move_to_end(t)
+                return self._d[t]
+        if not self.store.has(t):
+            return None
+        arr = self.store.load_grid(t)
+        with self._lock:
+            self._d[t] = arr
+            while len(self._d) > self.size:
+                self._d.popitem(last=False)
+        return arr
 
 
 def _build_one(args):

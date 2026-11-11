@@ -9,17 +9,21 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import threading
 import time
 
+import numpy as np
 from flask import Flask, abort, render_template, request, send_from_directory
 
 import config
 from common import local_str, read_json, sanitize, write_json
+from geo import km_per_cell, latlon_to_cell
 from metrics import Scores
-from radar_store import RadarStore
+from radar_store import FrameCache, RadarStore
 
 app = Flask(__name__)
 store = RadarStore()
+frames = FrameCache(store, size=48)
 LEDGER_FILE = config.PRED_DIR / "ledger.jsonl"
 METHODS = ("model", "persistence", "optflow")
 
@@ -123,6 +127,88 @@ def prediction(t0: int):
                             "url": f"/obs/{t}.png" if store.has(t) else None} for t in meta["valid_times"]]
     payload["metrics"] = read_json(folder / "metrics.json")
     return _json(payload)
+
+
+@app.route("/api/forecasts")
+def forecasts():
+    """Forecasts of the last N hours (newest first), for the comparison picker."""
+    hours = min(max(int(request.args.get("hours", 24)), 1), 24 * 30)
+    cutoff = time.time() - hours * 3600
+    out = []
+    if config.PRED_DIR.exists():
+        for folder in config.PRED_DIR.iterdir():
+            if not (folder.is_dir() and folder.name.isdigit() and int(folder.name) >= cutoff):
+                continue
+            metrics = read_json(folder / "metrics.json")
+            model = (metrics or {}).get("scores", {}).get("model", {})
+            out.append({"t0": int(folder.name), "local": local_str(int(folder.name)),
+                        "verified": bool(metrics and not metrics.get("skipped")),
+                        "mean_csi": model.get("mean_csi"),
+                        "valid_leads": (metrics or {}).get("valid_leads", 0),
+                        "obs_rain_px": (metrics or {}).get("obs_rain_px")})
+    out.sort(key=lambda r: r["t0"], reverse=True)
+    return _json(out)
+
+
+_pred_cache: dict[int, np.ndarray] = {}
+_pred_lock = threading.Lock()
+
+
+def _forecast_field(t0: int) -> np.ndarray | None:
+    with _pred_lock:
+        if t0 in _pred_cache:
+            return _pred_cache[t0]
+    try:
+        with np.load(config.PRED_DIR / str(t0) / "pred.npz") as z:
+            arr = z["mm"].astype(np.float32)
+    except OSError:
+        return None
+    with _pred_lock:
+        _pred_cache[t0] = arr
+        for old in sorted(_pred_cache)[:-4]:
+            del _pred_cache[old]
+    return arr
+
+
+def _sample(field: np.ndarray, r: int, c: int) -> tuple[float, float]:
+    """(mean over the 3x3 cells around the point, max within ~2 cells)."""
+    n = field.shape[0]
+    near = field[max(0, r - 1):min(n, r + 2), max(0, c - 1):min(n, c + 2)]
+    wide = field[max(0, r - 2):min(n, r + 3), max(0, c - 2):min(n, c + 3)]
+    return round(float(near.mean()), 2), round(float(wide.max()), 2)
+
+
+@app.route("/api/point")
+def point():
+    """Rain at a coordinate: last hour observed + latest forecast."""
+    try:
+        lat, lon = float(request.args["lat"]), float(request.args["lon"])
+    except (KeyError, ValueError):
+        return _json({"error": "Give lat and lon as numbers, e.g. 32.08, 34.78"}), 400
+    cell = latlon_to_cell(lat, lon)
+    if cell is None:
+        return _json({"error": "That point is outside the radar coverage (about 29.4–34.5°N, 31.8–37.9°E)."}), 400
+    r, c = cell
+    latest = store.latest_time()
+    observed, forecast, t0 = [], [], None
+    if latest:
+        for t in store.list_times(latest - (config.N_IN - 1) * config.STEP, latest):
+            field = frames.get(t)
+            if field is not None:
+                mm, near_max = _sample(field, r, c)
+                observed.append({"t": t, "local": local_str(t, "%H:%M"), "mm": mm, "near_max": near_max})
+    fc = _latest_forecast()
+    if fc and latest and fc["t0"] >= latest - 15 * 60:
+        field = _forecast_field(fc["t0"])
+        if field is not None:
+            t0 = fc["t0"]
+            for k, f in enumerate(fc["frames"]):
+                if f["t"] > (latest or 0):
+                    mm, near_max = _sample(field[k], r, c)
+                    forecast.append({"t": f["t"], "local": f["local"], "lead": (k + 1) * config.STEP // 60,
+                                     "mm": mm, "near_max": near_max})
+    return _json({"lat": lat, "lon": lon, "radius_km": round(1.5 * km_per_cell(), 1), "t0": t0,
+                  "now": latest, "observed": observed, "forecast": forecast})
 
 
 _ledger_cache: dict = {}
