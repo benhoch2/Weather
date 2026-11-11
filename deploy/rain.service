@@ -12,7 +12,9 @@ Environment=WEATHER_PREDICTION_RETENTION_DAYS=7
 ExecStart=/usr/bin/python3 start.py --host 127.0.0.1 --port 5050 --no-retrain --require-access
 Restart=on-failure
 RestartSec=20
-# Keep the Pi responsive for its other apps
+# Keep the Pi responsive for its other apps. Measured use is ~255 MB (predictor ~166 MB).
+# Note: benh-pi boots with cgroup_disable=memory, so MemoryMax is NOT enforced there
+# (it would need cgroup_enable=memory in /boot/firmware/cmdline.txt and a reboot).
 Nice=5
 MemoryMax=450M
 
