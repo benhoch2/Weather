@@ -40,8 +40,8 @@ def evaluate_baseline(tl: Timeline, starts: np.ndarray, name: str) -> Scores:
     fn, scores = METHODS[name], Scores()
     t0 = time.monotonic()
     for k, i in enumerate(starts, 1):
-        inputs, targets = tl.window_mm(int(i))
-        scores.update(fn(inputs), targets)
+        inputs, targets, valid = tl.window_mm(int(i))
+        scores.update(fn(inputs), targets, valid)
         if k % 200 == 0:
             log.info("  %s: %d/%d windows (%.1f/s)", name, k, len(starts), k / (time.monotonic() - t0))
     return scores
@@ -54,8 +54,8 @@ def evaluate_model(tl: Timeline, starts: np.ndarray, model, batch: int = 16) -> 
         chunk = starts[b:b + batch]
         pairs = [tl.window_mm(int(i)) for i in chunk]
         preds = predict_mm(model, np.stack([p[0] for p in pairs]))
-        for pred, (_, targets) in zip(preds, pairs):
-            scores.update(pred, targets)
+        for pred, (_, targets, valid) in zip(preds, pairs):
+            scores.update(pred, targets, valid)
     return scores
 
 

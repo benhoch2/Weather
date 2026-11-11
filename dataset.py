@@ -52,18 +52,29 @@ class Timeline:
         self.rain_px = np.where(self.present, (self.frames >= Q_RAIN).sum(axis=(1, 2)), 0)
         log.info("Timeline: %d days, %d frames present", len(frames), int(self.present.sum()))
 
-    def windows(self, split: str, n_in: int = config.N_IN, n_out: int = config.N_OUT) -> np.ndarray:
-        """Start indices of gap-free windows of n_in + n_out frames within one split."""
+    def windows(self, split: str, n_in: int = config.N_IN, n_out: int = config.N_OUT,
+                min_targets: int = 1) -> np.ndarray:
+        """Start indices of usable windows within one split.
+
+        All n_in input frames must be present (no gaps in the past hour).  The
+        n_out target frames may have holes; at least `min_targets` must exist.
+        Missing targets are masked out of the loss and the scores.
+        """
         L = n_in + n_out
         n = len(self.times) - L + 1
         if n <= 0:
             return np.zeros(0, dtype=np.int64)
         cs = np.concatenate([[0], np.cumsum(self.present.astype(np.int64))])
-        complete = (cs[L:L + n] - cs[:n]) == L
+        inputs_complete = (cs[n_in:n_in + n] - cs[:n]) == n_in
+        targets_present = cs[L:L + n] - cs[n_in:n_in + n]
         contiguous = (self.times[L - 1:L - 1 + n] - self.times[:n]) == (L - 1) * config.STEP
         sid = SPLITS.index(split)
         same_split = (self.split[:n] == sid) & (self.split[L - 1:L - 1 + n] == sid)
-        return np.flatnonzero(complete & contiguous & same_split)
+        return np.flatnonzero(inputs_complete & (targets_present >= min_targets) & contiguous & same_split)
+
+    def target_mask(self, i: int, n_in: int = config.N_IN, n_out: int = config.N_OUT) -> np.ndarray:
+        """Bool (n_out,) - which target frames of window i were observed."""
+        return self.present[i + n_in:i + n_in + n_out].copy()
 
     def rainy(self, starts: np.ndarray, n_in: int = config.N_IN, n_out: int = config.N_OUT) -> np.ndarray:
         """Bool per window: rain in the last input frame or any target frame."""
@@ -71,9 +82,9 @@ class Timeline:
         return (self.rain_px[idx] >= RAINY_GRID_PX).any(axis=1)
 
     def window_mm(self, i: int, n_in: int = config.N_IN, n_out: int = config.N_OUT):
-        """(inputs (n_in,G,G), targets (n_out,G,G)) in mm/h for window start i."""
+        """(inputs (n_in,G,G), targets (n_out,G,G), target mask (n_out,)) in mm/h for window start i."""
         block = decode_mm(self.frames[i:i + n_in + n_out])
-        return block[:n_in], block[n_in:]
+        return block[:n_in], block[n_in:], self.target_mask(i, n_in, n_out)
 
 
 def load_timeline(store: RadarStore | None = None, workers: int = 6) -> Timeline:

@@ -36,10 +36,15 @@ _W_EDGES = torch.log1p(torch.tensor([0.5, 2.0, 5.0, 10.0, 30.0]))
 _W_VALUES = torch.tensor([1.0, 2.0, 5.0, 10.0, 20.0, 30.0])
 
 
-def weighted_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def weighted_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Rain-weighted MAE+MSE.  mask (B, n_out) bool drops target frames that were not observed."""
     w = _W_VALUES.to(target.device)[torch.bucketize(target, _W_EDGES.to(target.device))]
     err = pred - target
-    return (w * (err.abs() + err.pow(2))).mean()
+    loss = w * (err.abs() + err.pow(2))
+    if mask is None:
+        return loss.mean()
+    m = mask[:, :, None, None].to(loss.dtype)
+    return (loss * m).sum() / (m.sum() * loss.shape[-1] * loss.shape[-2]).clamp_min(1)
 
 
 class BatchSampler:
@@ -49,7 +54,7 @@ class BatchSampler:
         rainy = tl.rainy(starts)
         self.rainy, self.dry = starts[rainy], starts[~rainy]
         self.dry_fraction = dry_fraction if len(self.dry) else 0.0
-        self.frames = tl.frames
+        self.frames, self.present = tl.frames, tl.present
         self.rng = np.random.default_rng(seed)
         self.offsets = np.arange(config.N_IN + config.N_OUT)
 
@@ -57,9 +62,11 @@ class BatchSampler:
         n_dry = self.rng.binomial(batch, self.dry_fraction)
         pick = np.concatenate([self.rng.choice(self.rainy, batch - n_dry),
                                self.rng.choice(self.dry, n_dry) if n_dry else np.zeros(0, np.int64)])
-        block = torch.from_numpy(self.frames[pick[:, None] + self.offsets[None, :]])
+        idx = pick[:, None] + self.offsets[None, :]
+        block = torch.from_numpy(self.frames[idx])
         block = codes_to_log1p(block.pin_memory().to(dev, non_blocking=True))
-        return block[:, :config.N_IN].contiguous(), block[:, config.N_IN:].contiguous()
+        mask = torch.from_numpy(self.present[idx[:, config.N_IN:]]).to(dev)
+        return block[:, :config.N_IN].contiguous(), block[:, config.N_IN:].contiguous(), mask
 
 
 def write_status(**kw) -> None:
@@ -106,10 +113,10 @@ def train(epochs: int = 40, steps: int = 1000, batch: int = 16, lr: float = 1e-3
         model.train()
         losses = []
         for _ in range(steps):
-            x, y = sampler(batch, dev)
+            x, y, mask = sampler(batch, dev)
             with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=dev.type == "cuda"):
                 pred = model(x)
-            loss = weighted_loss(pred.float(), y)
+            loss = weighted_loss(pred.float(), y, mask)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

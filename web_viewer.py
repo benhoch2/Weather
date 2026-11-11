@@ -267,16 +267,47 @@ def _latest_offline_eval() -> dict | None:
             "mean_csi": {k: v.get("mean_csi") for k, v in (data.get("results") or {}).items()}}
 
 
+LOOPBACK = {"127.0.0.1", "::1"}
+
+
+def require_cloudflare_access() -> None:
+    """Refuse any non-local request that did not come through Cloudflare Access.
+
+    Access adds a signed Cf-Access-Jwt-Assertion header to every request it lets
+    through.  This is a safety net, not the gate itself: if the Access policy is
+    ever removed or misconfigured, the site answers 403 instead of going public.
+    """
+    @app.before_request
+    def _check_access():
+        if request.remote_addr in LOOPBACK:
+            return None
+        if not request.headers.get("Cf-Access-Jwt-Assertion"):
+            return "Login required (Cloudflare Access).", 403
+        return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default=config.VIEWER_HOST)
     ap.add_argument("--port", type=int, default=config.VIEWER_PORT)
+    ap.add_argument("--require-access", action="store_true",
+                    help="403 for non-local requests without a Cloudflare Access token (use when published)")
     ap.add_argument("--web-debug", action="store_true", help="show HTTP access log lines")
     a = ap.parse_args()
+    if a.require_access:
+        require_cloudflare_access()
     if not a.web_debug:
         logging.getLogger("werkzeug").setLevel(logging.ERROR)
-    print(f"Weather radar viewer on http://{'localhost' if a.host == '127.0.0.1' else a.host}:{a.port}", flush=True)
-    app.run(host=a.host, port=a.port, debug=False, use_reloader=False, threaded=True)
+    hosts = [h.strip() for h in a.host.split(",") if h.strip()]   # e.g. "127.0.0.1,100.79.167.68"
+    shown = ", ".join(f"http://{'localhost' if h == '127.0.0.1' else h}:{a.port}" for h in hosts)
+    print(f"Weather radar viewer on {shown}"
+          f"{' (Cloudflare Access required for remote requests)' if a.require_access else ''}", flush=True)
+    try:
+        from waitress import serve
+    except ImportError:   # fall back to Flask's development server (first host only)
+        app.run(host=hosts[0], port=a.port, debug=False, use_reloader=False, threaded=True)
+        return
+    serve(app, listen=" ".join(f"{h}:{a.port}" for h in hosts), threads=8, ident="rain-nowcast")
 
 
 if __name__ == "__main__":

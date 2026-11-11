@@ -13,3 +13,4 @@ tzdata==2026.6
 matplotlib==3.11.2
 pysteps==1.21.5
 pytest==9.2.0
+waitress==3.0.2

@@ -33,11 +33,15 @@ def test_windows_skip_gaps_and_split_boundaries(store, monkeypatch):
     starts = tl.windows("train", n_in=4, n_out=2)          # windows of 6 frames
     assert len(starts) > 0
     for s in starts:
-        assert not (s <= 30 <= s + 5), "window crosses the gap"
+        assert not (s <= 30 <= s + 3), "gap inside the input frames"
         assert np.all(np.diff(tl.times[s:s + 6]) == config.STEP)
+    # gaps in the target frames are allowed and masked
+    assert 25 in starts and 26 in starts                    # gap at target index 1 / 0
+    _, _, valid = tl.window_mm(25, n_in=4, n_out=2)
+    assert valid.tolist() == [True, False]
     assert len(tl.windows("val", n_in=4, n_out=2)) == 0
-    inputs, targets = tl.window_mm(int(starts[0]), n_in=4, n_out=2)
-    assert inputs.shape == (4, 32, 32) and targets.shape == (2, 32, 32)
+    inputs, targets, valid = tl.window_mm(int(starts[0]), n_in=4, n_out=2)
+    assert inputs.shape == (4, 32, 32) and targets.shape == (2, 32, 32) and valid.all()
     assert inputs.max() > 1
 
 
