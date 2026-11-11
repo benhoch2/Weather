@@ -8,7 +8,6 @@ Output: all N_OUT future frames at once, in log1p(mm/h) (softplus, >= 0).
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +19,12 @@ import config
 from radar_store import DECODE_LUT
 
 
-def _block(cin: int, cout: int) -> nn.Sequential:
+def _block(cin: int, cout: int, norm: str) -> nn.Sequential:
+    if norm == "batch":   # plain Conv-BN-ReLU: folds into convs on export, runs anywhere (OpenCV DNN on a Pi)
+        return nn.Sequential(
+            nn.Conv2d(cin, cout, 3, padding=1, bias=False), nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
+            nn.Conv2d(cout, cout, 3, padding=1, bias=False), nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
+        )
     groups = 8 if cout % 8 == 0 else 1
     return nn.Sequential(
         nn.Conv2d(cin, cout, 3, padding=1, bias=False), nn.GroupNorm(groups, cout), nn.SiLU(inplace=True),
@@ -29,21 +33,23 @@ def _block(cin: int, cout: int) -> nn.Sequential:
 
 
 class UNet(nn.Module):
-    def __init__(self, n_in: int = config.N_IN, n_out: int = config.N_OUT, base: int = 48, depth: int = 4):
+    def __init__(self, n_in: int = config.N_IN, n_out: int = config.N_OUT, base: int = 48, depth: int = 4,
+                 norm: str = "group"):
         super().__init__()
-        self.hparams = {"n_in": n_in, "n_out": n_out, "base": base, "depth": depth}
+        self.hparams = {"n_in": n_in, "n_out": n_out, "base": base, "depth": depth, "norm": norm}
         chans = [base * 2 ** i for i in range(depth + 1)]
         self.enc = nn.ModuleList()
         cin = n_in + 2
         for c in chans:
-            self.enc.append(_block(cin, c))
+            self.enc.append(_block(cin, c, norm))
             cin = c
         self.up = nn.ModuleList()
         self.dec = nn.ModuleList()
         for c_skip, c_deep in zip(reversed(chans[:-1]), reversed(chans[1:])):
             self.up.append(nn.ConvTranspose2d(c_deep, c_skip, 2, stride=2))
-            self.dec.append(_block(c_skip * 2, c_skip))
+            self.dec.append(_block(c_skip * 2, c_skip, norm))
         self.head = nn.Conv2d(chans[0], n_out, 1)
+        self.const_coords: torch.Tensor | None = None   # set for ONNX export (no runtime linspace)
 
     @staticmethod
     def _coords(x: torch.Tensor) -> torch.Tensor:
@@ -53,7 +59,8 @@ class UNet(nn.Module):
         return torch.cat([yy, xx], dim=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([x, self._coords(x)], dim=1)
+        coords = self.const_coords if self.const_coords is not None else self._coords(x)
+        x = torch.cat([x, coords], dim=1)
         skips = []
         for i, enc in enumerate(self.enc):
             x = enc(x)
@@ -99,14 +106,23 @@ def load_checkpoint(path: Path, device: str | torch.device = "cpu") -> tuple[UNe
     return model, {"grid": ckpt["grid"], **ckpt.get("meta", {})}
 
 
-def current_model_path() -> Path | None:
-    """Path of the promoted model from models/current.json, or None."""
-    try:
-        info = json.loads(config.CURRENT_MODEL_FILE.read_text())
-        p = config.MODELS_DIR / info["file"]
-        return p if p.exists() else None
-    except (OSError, ValueError, KeyError):
-        return None
+import forecaster  # noqa: E402  (torch-free model lookup, shared with the Pi)
+
+current_model_path = forecaster.current_model_path
+
+
+def export_onnx(model: UNet, path: Path, grid: int = config.GRID) -> Path:
+    """Export for OpenCV DNN / ONNX Runtime: fixed 1x12xGxG input in log1p(mm/h), output the same."""
+    path = Path(path)
+    net = UNet(**model.hparams)
+    net.load_state_dict({k: v.detach().cpu() for k, v in model.state_dict().items()})
+    net.eval()
+    x = torch.zeros(1, net.hparams["n_in"], grid, grid)
+    net.const_coords = UNet._coords(x)
+    with torch.no_grad():
+        torch.onnx.export(net, (x,), str(path), input_names=["x"], output_names=["y"],
+                          opset_version=13, dynamo=False, do_constant_folding=True)
+    return path
 
 
 def device() -> torch.device:

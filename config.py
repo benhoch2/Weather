@@ -59,5 +59,5 @@ VIEWER_HOST = os.environ.get("WEATHER_RADAR_VIEWER_HOST", "127.0.0.1")
 VIEWER_PORT = int(os.environ.get("WEATHER_RADAR_VIEWER_PORT", 5050))
 FETCH_INTERVAL = 120        # seconds between IMS list polls
 GAP_FILL_HOURS = 48         # how far back the live fetcher repairs gaps
-PREDICTION_RETENTION_DAYS = 30
+PREDICTION_RETENTION_DAYS = int(os.environ.get("WEATHER_PREDICTION_RETENTION_DAYS", 30))
 EXIT_NO_MODEL = 3           # predictor exit code: no trained model -> don't restart

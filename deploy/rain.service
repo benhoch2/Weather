@@ -1,0 +1,20 @@
+[Unit]
+Description=Rain nowcast (IMS radar fetcher, forecaster, web viewer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=benh
+WorkingDirectory=/home/benh/Weather
+Environment=PYTHONUNBUFFERED=1
+Environment=WEATHER_PREDICTION_RETENTION_DAYS=7
+# Training happens on the PC; the Pi only fetches, forecasts (ONNX via OpenCV) and serves.
+ExecStart=/usr/bin/python3 start.py --host 127.0.0.1 --port 5050 --no-retrain --require-access
+Restart=on-failure
+RestartSec=20
+# Keep the Pi responsive for its other apps
+Nice=5
+MemoryMax=450M
+
+[Install]
+WantedBy=multi-user.target

@@ -25,7 +25,7 @@ import config
 from common import local_str, setup_logging, write_json
 from dataset import Timeline, load_timeline
 from evaluate import evaluate_model, select_windows
-from model import UNet, codes_to_log1p, current_model_path, device, load_checkpoint, save_checkpoint
+from model import UNet, codes_to_log1p, current_model_path, device, export_onnx, load_checkpoint, save_checkpoint
 
 log = logging.getLogger("train")
 STATUS_FILE = config.STATUS_DIR / "training.json"
@@ -75,7 +75,7 @@ def write_status(**kw) -> None:
 
 def train(epochs: int = 40, steps: int = 1000, batch: int = 16, lr: float = 1e-3, base: int = 48,
           patience: int = 6, val_windows: int = 600, init: Path | None = None, smoke: bool = False,
-          tl: Timeline | None = None) -> dict:
+          tl: Timeline | None = None, norm: str = "group", promote: bool = True, tag: str = "") -> dict:
     dev = device()
     if dev.type != "cuda":
         log.warning("CUDA not available - training on CPU will be very slow.")
@@ -91,7 +91,7 @@ def train(epochs: int = 40, steps: int = 1000, batch: int = 16, lr: float = 1e-3
         model, _ = load_checkpoint(init, dev)
         log.info("Fine-tuning from %s", init)
     else:
-        model = UNet(base=base).to(dev)
+        model = UNet(base=base, norm=norm).to(dev)
     model.train()
     n_params = sum(p.numel() for p in model.parameters())
     log.info("Model: %s, %.1fM parameters, device %s", model.hparams, n_params / 1e6,
@@ -143,14 +143,18 @@ def train(epochs: int = 40, steps: int = 1000, batch: int = 16, lr: float = 1e-3
 
     model.load_state_dict(best_state)
     model.eval()
-    name = f"nowcast_{datetime.now():%Y%m%d_%H%M%S}{'_smoke' if smoke else ''}.pt"
+    name = f"nowcast_{datetime.now():%Y%m%d_%H%M%S}{'_' + tag if tag else ''}{'_smoke' if smoke else ''}.pt"
     path = config.MODELS_DIR / name
     save_checkpoint(model, path, {"created": int(time.time()), "val": best_summary,
                                   "init_from": str(init) if init else None,
                                   "train_windows": int(len(train_starts))})
     log.info("Saved %s (val mean CSI %.4f)", path, best_csi)
     decision = {"checkpoint": name, "val_mean_csi": best_csi}
-    if not smoke:
+    if model.hparams.get("norm") == "batch":   # Pi-compatible: also export for OpenCV DNN
+        onnx_path = export_onnx(model, path.with_suffix(".onnx"))
+        decision["onnx"] = onnx_path.name
+        log.info("Exported %s", onnx_path.name)
+    if promote and not smoke:
         decision.update(promote_if_better(path, model, tl, val_starts))
     write_status(state="done", **decision)
     return decision
@@ -189,11 +193,16 @@ def main() -> None:
     ap.add_argument("--base", type=int, default=48, help="U-Net base width")
     ap.add_argument("--patience", type=int, default=6)
     ap.add_argument("--init", default=None, help="checkpoint to fine-tune ('current' = live model)")
+    ap.add_argument("--norm", choices=["group", "batch"], default="group",
+                    help="'batch' = Pi-compatible model, also exported to ONNX")
+    ap.add_argument("--no-promote", action="store_true", help="never replace the live model (experiments)")
+    ap.add_argument("--tag", default="", help="suffix for the checkpoint name, e.g. 'pi'")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     init = current_model_path() if a.init == "current" else (Path(a.init) if a.init else None)
     torch.backends.cudnn.benchmark = True
-    train(a.epochs, a.steps, a.batch, a.lr, a.base, a.patience, init=init, smoke=a.smoke)
+    train(a.epochs, a.steps, a.batch, a.lr, a.base, a.patience, init=init, smoke=a.smoke,
+          norm=a.norm, promote=not a.no_promote, tag=a.tag)
 
 
 if __name__ == "__main__":

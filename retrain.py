@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import subprocess
+import sys
 import time
 from datetime import timedelta
 
@@ -44,6 +46,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--epochs", type=int, default=8)
+    ap.add_argument("--no-sync", action="store_true", help="skip downloading recent data from IMS first")
+    ap.add_argument("--no-push", action="store_true", help="don't copy a promoted model to the Pi")
     a = ap.parse_args()
 
     prev = read_json(STATUS_FILE, {}) or {}
@@ -57,6 +61,12 @@ def main() -> None:
         write_json(STATUS_FILE, status)
         log.info(status["reason"])
         return
+
+    if not a.no_sync:
+        # The live fetcher runs on the Pi; bring this machine's archive up to date from IMS.
+        from backfill import run as backfill_run
+        log.info("Syncing radar data since %s from the IMS archive", local_str(since))
+        backfill_run(min(since, now - 2 * 86400), now, margin_h=3, rain_px=config.RAINY_PIXELS, all_frames=False)
 
     n_new = new_rainy_frames(RadarStore(), since)
     status["new_rainy_frames"] = n_new
@@ -78,6 +88,13 @@ def main() -> None:
         return
     status.update(result="promoted" if decision.get("promoted") else "kept_current",
                   data_until=now, **decision)
+    if decision.get("promoted") and decision.get("onnx") and not a.no_push:
+        try:   # ship the better model to the Pi (needs SSH access; see push_model.py)
+            subprocess.run([sys.executable, "push_model.py"], cwd=config.PROJECT_DIR, check=True, timeout=600)
+            status["pushed_to_pi"] = True
+        except Exception as e:
+            status["pushed_to_pi"] = False
+            log.warning("Promoted, but pushing to the Pi failed: %s", e)
     write_json(STATUS_FILE, status)
     log.info("Retrain finished: %s", status["result"])
 

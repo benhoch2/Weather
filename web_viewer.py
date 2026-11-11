@@ -279,7 +279,10 @@ def require_cloudflare_access() -> None:
     """
     @app.before_request
     def _check_access():
-        if request.remote_addr in LOOPBACK:
+        # A local tunnel (cloudflared on the same machine) connects from loopback, so
+        # anything carrying Cloudflare's Cf-Connecting-IP header is treated as remote.
+        via_cloudflare = "Cf-Connecting-Ip" in request.headers
+        if request.remote_addr in LOOPBACK and not via_cloudflare:
             return None
         if not request.headers.get("Cf-Access-Jwt-Assertion"):
             return "Login required (Cloudflare Access).", 403

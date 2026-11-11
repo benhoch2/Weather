@@ -29,7 +29,7 @@ from baselines import optical_flow, persistence
 from common import local_str, read_json, setup_logging, write_json
 from ims_source import colorize
 from metrics import Scores
-from model import current_model_path, device, load_checkpoint, predict_mm
+from forecaster import current_model_path, load_forecaster
 from radar_store import FrameCache, RadarStore
 
 log = logging.getLogger("predictor")
@@ -66,8 +66,8 @@ class Predictor:
     def __init__(self):
         self.store = RadarStore()
         self.frames = FrameCache(self.store)
-        self.dev = device()
-        self.model = None
+        self.dev = "none"
+        self.model = None      # a forecaster with .predict(inputs_mm) -> mm
         self.model_name = None
         self.model_mtime = None
         self.last_t0 = self._latest_prediction()
@@ -84,11 +84,12 @@ class Predictor:
         path = current_model_path()
         if path is None:
             return self.model is not None
-        model, meta = load_checkpoint(path, self.dev)
-        if meta.get("grid") != config.GRID:
-            log.error("Model %s was trained at grid %s, config is %s", path.name, meta.get("grid"), config.GRID)
+        model, grid = load_forecaster(path)
+        if grid != config.GRID:
+            log.error("Model %s was trained at grid %s, config is %s", path.name, grid, config.GRID)
             return self.model is not None
         self.model, self.model_name, self.model_mtime = model, path.stem, mtime
+        self.dev = model.device
         log.info("Loaded model %s on %s", path.name, self.dev)
         return True
 
@@ -109,7 +110,7 @@ class Predictor:
             log.warning("Cannot forecast from %s: %s", local_str(t0), self.detail)
             return
         started = time.perf_counter()
-        pred = predict_mm(self.model, inputs, self.dev)
+        pred = self.model.predict(inputs)
         out = config.PRED_DIR / str(t0)
         out.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(out / "pred.npz", mm=pred.astype(np.float16))

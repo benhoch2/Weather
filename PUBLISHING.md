@@ -1,59 +1,65 @@
-# Publishing at rain.musktzur.uk
+# Running on benh-pi and publishing at rain.musktzur.uk
 
-The app runs on this PC (it has the GPU). benh-pi's existing Cloudflare Tunnel gets one more
-ingress rule that forwards `rain.musktzur.uk` to the PC over Tailscale. Cloudflare Access puts a
-login in front of it.
+**Split (option A):**
+
+| benh-pi (always on) | This PC (GPU, when it's on) |
+|---|---|
+| `fetcher.py`: live IMS frames | `backfill.py`: the history download |
+| `predictor.py`: forecasts every 5 min with the small model (ONNX via OpenCV, no PyTorch) | `train.py` / `retrain.py`: training, promoted only if better |
+| `web_viewer.py`: the site, on `127.0.0.1:5050` | `push_model.py`: copies a promoted model to the Pi |
 
 ```
-browser → Cloudflare edge (Access login) → tunnel "benh-pi" on benh-pi
-        → Tailscale → this PC 100.79.167.68:5050 (waitress, --require-access)
+browser → Cloudflare edge (Access login) → tunnel "benh-pi" → 127.0.0.1:5050 on benh-pi
 ```
 
-Nothing changes on the TP-Link router. Nothing on the home Wi-Fi can reach the app:
-it listens only on localhost and the PC's Tailscale address, and the firewall rule
-admits only benh-pi.
+The Pi runs the small `--norm batch` model (1.9M parameters) exported to ONNX. PyTorch doesn't exist
+for the Pi's 32-bit OS, and OpenCV's DNN module runs the model instead.
 
-## Go-live steps, in this order
+## One-time Pi setup
+
+```bash
+sudo apt install -y python3-opencv python3-waitress        # numpy, pillow, flask, requests, psutil already there
+git clone https://github.com/benhoch2/Weather.git ~/Weather && cd ~/Weather
+git checkout rebuild-ims-pytorch                             # until it's merged
+sudo cp deploy/rain.service /etc/systemd/system/rain.service
+sudo systemctl daemon-reload && sudo systemctl enable --now rain
+```
+
+From the PC: `.venv\Scripts\python.exe push_model.py` copies the current Pi model over. The Pi's predictor picks
+it up within 30 seconds. The service keeps forecasts for 7 days (SD card), caps itself at 450 MB of RAM, and runs
+at lower priority than the other apps.
+
+Code updates use the `deploy` skill (`.claude/deploy.json`): `git pull` + `systemctl restart rain`.
+
+## Publishing, in this order
 
 The order matters. Access is set up before DNS exists, so the hostname is never public without a login.
 
-1. **Cloudflare Access** (dashboard, done by Ben): Zero Trust → Access → Applications →
-   *Add* → Self-hosted. Domain `rain.musktzur.uk`. Add a policy *Allow* → *Emails* → the
-   addresses that may log in. Login method: one-time PIN.
-2. **Windows firewall** (admin PowerShell on this PC), allowing benh-pi only:
-   ```powershell
-   New-NetFirewallRule -DisplayName "Rain nowcast from benh-pi (Tailscale)" -Direction Inbound `
-     -Protocol TCP -LocalPort 5050 -RemoteAddress 100.100.146.14 -Action Allow -Profile Any
-   ```
-3. **Start the app**: `publish.bat`. It listens on `127.0.0.1` and `100.79.167.68`, port 5050,
-   with `--require-access`. Then check from benh-pi:
-   `curl -s -o /dev/null -w '%{http_code}\n' http://100.79.167.68:5050/` should print `403`.
-   That's the expected result: the request has no Access token.
-4. **Tunnel ingress on benh-pi**: add the rule *above* the catch-all in `/etc/cloudflared/config.yml`:
+1. **Cloudflare Access** (dashboard, done by Ben): Zero Trust → Access → Applications → *Add* → Self-hosted.
+   Domain `rain.musktzur.uk`. Policy *Allow* → *Emails* → the people who may log in. One-time PIN login.
+2. **Tunnel ingress on benh-pi**: add the rule *above* the catch-all in `/etc/cloudflared/config.yml`:
    ```yaml
      - hostname: rain.musktzur.uk
-       service: http://100.79.167.68:5050
+       service: http://localhost:5050
    ```
-   Then (from the BeerServer runbook; never SIGHUP):
    ```bash
    sudo systemd-run --on-active=15min --unit=cf-deadman systemctl stop cloudflared   # safety net
    sudo cloudflared tunnel ingress validate
-   sudo systemctl restart cloudflared
+   sudo systemctl restart cloudflared                                                  # never SIGHUP
    cloudflared tunnel route dns --overwrite-dns benh-pi rain.musktzur.uk
-   # verify, then cancel the dead-man switch:
-   sudo systemctl stop cf-deadman.timer
+   sudo systemctl stop cf-deadman.timer                                                # once verified
    ```
-5. **Verify**: open https://rain.musktzur.uk in a private window. You should get the Cloudflare
-   Access login, then the app after logging in. `dig rain.musktzur.uk` should show only Cloudflare
-   addresses, never our IP.
+3. **Verify**: https://rain.musktzur.uk in a private window should show the Access login, then the app.
+   `dig rain.musktzur.uk` should show only Cloudflare addresses.
+
+## Safety net
+
+The service runs with `--require-access`. Any request that came through Cloudflare (it carries `Cf-Connecting-IP`)
+but has no `Cf-Access-Jwt-Assertion` header gets a 403. If the Access policy is ever removed, the site
+refuses requests instead of going public. The check doesn't verify the token's signature; Access itself is the real gate.
 
 ## Notes
 
-- **The site is down while this PC is off or asleep.** Sleep on AC power is set to never. Closing a
-  laptop lid may still sleep it (Control Panel → Power Options → *Choose what closing the lid does*).
-- **Roll back**: remove the ingress rule and restart cloudflared, or just stop `publish.bat`.
-  Access keeps the hostname protected either way.
-- **Data credit**: radar data © Israel Meteorological Service (credited in the page footer). Check the
-  IMS terms of use before sharing beyond a private group.
-- The `--require-access` check only looks for the `Cf-Access-Jwt-Assertion` header; it doesn't verify
-  the signature. It's a safety net in case the Access policy is removed. The real gate is Access itself.
+- Radar data © Israel Meteorological Service (credited in the page footer). Check the IMS terms before sharing widely.
+- Baseline scoring on the Pi uses OpenCV optical flow (pysteps isn't installed there), so its optical-flow numbers
+  can differ slightly from the PC's offline evaluation.

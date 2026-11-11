@@ -11,4 +11,7 @@ def test_require_access_blocks_remote_without_token(tmp_path, monkeypatch):
     assert c.get("/api/status", environ_base=remote).status_code == 403
     ok = c.get("/api/status", environ_base=remote, headers={"Cf-Access-Jwt-Assertion": "x.y.z"})
     assert ok.status_code == 200
+    # cloudflared on the same machine: loopback, but Cloudflare headers present
+    tunnelled = c.get("/api/status", headers={"Cf-Connecting-Ip": "203.0.113.5"})
+    assert tunnelled.status_code == 403
     importlib.reload(web_viewer)            # don't leak the hook into other tests

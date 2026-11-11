@@ -1,0 +1,6 @@
+{
+  "host": "benh-pi",
+  "user": "benh",
+  "path": "~/Weather",
+  "service": "rain"
+}
