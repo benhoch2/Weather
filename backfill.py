@@ -66,10 +66,15 @@ class Fetcher:
                 self.store.mark_missing(t)
             return False
         try:
-            decode_png(data)                  # validate before saving
+            rain = decode_png(data)           # validate before saving
         except Exception as e:
             self.errors += 1
             log.warning("invalid image for %s: %s", local_str(t), e)
+            return False
+        if self.store.is_stale_repeat(t, data, rain):
+            self.absent += 1
+            self.store.mark_missing(t)
+            log.warning("stale repeat of the previous frame at %s - treated as missing", local_str(t))
             return False
         self.store.save(t, data)
         self.saved += 1

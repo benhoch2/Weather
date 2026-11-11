@@ -35,7 +35,10 @@ def poll_latest(f: Fetcher, client: ImsClient) -> dict:
         except requests.RequestException as e:
             log.warning("download failed for %s: %s", local_str(t), e)
             continue
-        if data:
+        if data and f.store.is_stale_repeat(t, data):
+            log.warning("IMS frame %s repeats the previous one (stuck radar) - skipped", local_str(t))
+            f.store.mark_missing(t)
+        elif data:
             f.store.save(t, data)
             new += 1
     if new:

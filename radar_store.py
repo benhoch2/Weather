@@ -139,6 +139,20 @@ class RadarStore:
                 return times[-1]
         return None
 
+    def is_stale_repeat(self, t: int, data: bytes, rain_mm: np.ndarray | None = None) -> bool:
+        """True if `data` is byte-identical to a neighbouring slot while it shows rain.
+
+        Real rain always moves between 5-minute scans, so an identical rainy
+        image means the radar product got stuck.  Identical dry frames are fine.
+        """
+        if rain_mm is not None and not (rain_mm > 0).any():
+            return False
+        for nb in (t - config.STEP, t + config.STEP):
+            p = self.path_for(nb)
+            if p.exists() and p.read_bytes() == data:
+                return rain_mm is not None or (decode_png(data) > 0).any()
+        return False
+
     # ── missing list ─────────────────────────────────────────────────────────
     @property
     def missing(self) -> set[int]:

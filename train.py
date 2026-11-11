@@ -101,6 +101,7 @@ def train(epochs: int = 40, steps: int = 1000, batch: int = 16, lr: float = 1e-3
 
     best_csi, best_state, best_summary, bad_epochs = -1.0, None, None, 0
     started = time.monotonic()
+    write_status(state="training", epoch=0, epochs=epochs, minutes=0, smoke=smoke)
     for epoch in range(1, epochs + 1):
         model.train()
         losses = []
