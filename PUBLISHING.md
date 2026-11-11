@@ -9,7 +9,7 @@
 | `web_viewer.py`: the site, on `127.0.0.1:5050` | `push_model.py`: copies a promoted model to the Pi |
 
 ```
-browser → Cloudflare edge (Access login) → tunnel "benh-pi" → 127.0.0.1:5050 on benh-pi
+browser → Cloudflare edge → tunnel "benh-pi" → 127.0.0.1:5050 on benh-pi (password page)
 ```
 
 The Pi runs the small `--norm batch` model (1.9M parameters) exported to ONNX. PyTorch doesn't exist
@@ -26,17 +26,29 @@ sudo systemctl daemon-reload && sudo systemctl enable --now rain
 ```
 
 From the PC: `.venv\Scripts\python.exe push_model.py` copies the current Pi model over. The Pi's predictor picks
-it up within 30 seconds. The service keeps forecasts for 7 days (SD card), caps itself at 450 MB of RAM, and runs
+it up within 30 seconds. The service keeps forecasts for 7 days (SD card), uses about 255 MB of RAM, and runs
 at lower priority than the other apps.
 
 Code updates use the `deploy` skill (`.claude/deploy.json`): `git pull` + `systemctl restart rain`.
 
-## Publishing, in this order
+## Password
 
-The order matters. Access is set up before DNS exists, so the hostname is never public without a login.
+The site uses one shared password. Set it on the Pi, in your own terminal (it's never echoed, logged or
+stored in plain text; only a salted hash goes to `~/Weather/data/auth/password.json`):
 
-1. **Cloudflare Access** (dashboard, done by Ben): Zero Trust → Access → Applications → *Add* → Self-hosted.
-   Domain `rain.musktzur.uk`. Policy *Allow* → *Emails* → the people who may log in. One-time PIN login.
+```bash
+ssh benh@benh-pi
+cd ~/Weather && python3 auth.py set-password
+```
+
+Each browser asks once, then a signed cookie keeps it logged in for about 400 days. Running
+`set-password` again changes the password and logs everyone out. After 5 wrong attempts, an address
+has to wait 15 minutes. Until a password is set, remote visitors get "not configured" (fails closed).
+Requests made on the Pi itself, not through the tunnel, need no password.
+
+## Publishing (tunnel)
+
+1. Set the password (above).
 2. **Tunnel ingress on benh-pi**: add the rule *above* the catch-all in `/etc/cloudflared/config.yml`:
    ```yaml
      - hostname: rain.musktzur.uk
@@ -49,14 +61,8 @@ The order matters. Access is set up before DNS exists, so the hostname is never 
    cloudflared tunnel route dns --overwrite-dns benh-pi rain.musktzur.uk
    sudo systemctl stop cf-deadman.timer                                                # once verified
    ```
-3. **Verify**: https://rain.musktzur.uk in a private window should show the Access login, then the app.
-   `dig rain.musktzur.uk` should show only Cloudflare addresses.
-
-## Safety net
-
-The service runs with `--require-access`. Any request that came through Cloudflare (it carries `Cf-Connecting-IP`)
-but has no `Cf-Access-Jwt-Assertion` header gets a 403. If the Access policy is ever removed, the site
-refuses requests instead of going public. The check doesn't verify the token's signature; Access itself is the real gate.
+3. **Verify**: https://rain.musktzur.uk should show the password page. `dig rain.musktzur.uk` should show
+   only Cloudflare addresses.
 
 ## Notes
 

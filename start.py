@@ -128,15 +128,15 @@ def main() -> None:
     ap.add_argument("--host", default=config.VIEWER_HOST)
     ap.add_argument("--port", type=int, default=config.VIEWER_PORT)
     ap.add_argument("--no-retrain", action="store_true", help="disable the nightly retrain")
-    ap.add_argument("--require-access", action="store_true",
-                    help="viewer refuses remote requests without a Cloudflare Access token")
+    ap.add_argument("--require-login", action="store_true",
+                    help="viewer requires the shared password (auth.py) for remote requests")
     ap.add_argument("--web-debug", action="store_true")
     a = ap.parse_args()
 
     acquire_lock()
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
     web_args = (["web_viewer.py", "--host", a.host, "--port", str(a.port)]
-                + (["--require-access"] if a.require_access else []) + (["--web-debug"] if a.web_debug else []))
+                + (["--require-login"] if a.require_login else []) + (["--web-debug"] if a.web_debug else []))
     children = {
         "FETCHER": Child("FETCHER", ["fetcher.py"]),
         "PREDICTOR": Child("PREDICTOR", ["predictor.py"]),

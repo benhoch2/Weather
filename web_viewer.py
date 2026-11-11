@@ -267,44 +267,23 @@ def _latest_offline_eval() -> dict | None:
             "mean_csi": {k: v.get("mean_csi") for k, v in (data.get("results") or {}).items()}}
 
 
-LOOPBACK = {"127.0.0.1", "::1"}
-
-
-def require_cloudflare_access() -> None:
-    """Refuse any non-local request that did not come through Cloudflare Access.
-
-    Access adds a signed Cf-Access-Jwt-Assertion header to every request it lets
-    through.  This is a safety net, not the gate itself: if the Access policy is
-    ever removed or misconfigured, the site answers 403 instead of going public.
-    """
-    @app.before_request
-    def _check_access():
-        # A local tunnel (cloudflared on the same machine) connects from loopback, so
-        # anything carrying Cloudflare's Cf-Connecting-IP header is treated as remote.
-        via_cloudflare = "Cf-Connecting-Ip" in request.headers
-        if request.remote_addr in LOOPBACK and not via_cloudflare:
-            return None
-        if not request.headers.get("Cf-Access-Jwt-Assertion"):
-            return "Login required (Cloudflare Access).", 403
-        return None
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default=config.VIEWER_HOST)
     ap.add_argument("--port", type=int, default=config.VIEWER_PORT)
-    ap.add_argument("--require-access", action="store_true",
-                    help="403 for non-local requests without a Cloudflare Access token (use when published)")
+    ap.add_argument("--require-login", action="store_true",
+                    help="require the shared password (auth.py) for every non-local request")
     ap.add_argument("--web-debug", action="store_true", help="show HTTP access log lines")
     a = ap.parse_args()
-    if a.require_access:
-        require_cloudflare_access()
+    if a.require_login:
+        from auth import init_auth
+        init_auth(app)
     if not a.web_debug:
         logging.getLogger("werkzeug").setLevel(logging.ERROR)
     hosts = [h.strip() for h in a.host.split(",") if h.strip()]   # e.g. "127.0.0.1,100.79.167.68"
     shown = ", ".join(f"http://{'localhost' if h == '127.0.0.1' else h}:{a.port}" for h in hosts)
     print(f"Weather radar viewer on {shown}"
-          f"{' (Cloudflare Access required for remote requests)' if a.require_access else ''}", flush=True)
+          f"{' (password required for remote requests)' if a.require_login else ''}", flush=True)
     try:
         from waitress import serve
     except ImportError:   # fall back to Flask's development server (first host only)
