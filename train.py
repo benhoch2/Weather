@@ -59,7 +59,7 @@ class BatchSampler:
                                self.rng.choice(self.dry, n_dry) if n_dry else np.zeros(0, np.int64)])
         block = torch.from_numpy(self.frames[pick[:, None] + self.offsets[None, :]])
         block = codes_to_log1p(block.pin_memory().to(dev, non_blocking=True))
-        return block[:, :config.N_IN], block[:, config.N_IN:]
+        return block[:, :config.N_IN].contiguous(), block[:, config.N_IN:].contiguous()
 
 
 def write_status(**kw) -> None:

@@ -42,8 +42,11 @@
   .muted { color: var(--text-2); } .small { font-size: 12px; color: var(--text-3); }
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
   .status { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
-          background: var(--surface-2); border: 1px solid var(--border); font-size: 12.5px; color: var(--text-2); white-space: nowrap; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; max-width: 100%;
+          background: var(--surface-2); border: 1px solid var(--border); font-size: 12.5px; color: var(--text-2);
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .grid2 > *, .legend > *, .timeline > * { min-width: 0; }
+  .table-wrap { overflow-x: auto; }
   .chip b { color: var(--text); font-weight: 600; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-3); flex: none; }
   .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
@@ -54,7 +57,8 @@
   #map, .cmp-map { height: 520px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); }
   .timeline { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
   .timeline input[type=range] { flex: 1 1 260px; accent-color: var(--accent); }
-  #frame-label { min-width: 210px; font-variant-numeric: tabular-nums; }
+  #frame-label { min-width: 190px; font-variant-numeric: tabular-nums; }
+  @media (max-width: 600px) { #frame-label { min-width: 0; flex: 1 1 100%; order: 3; } .timeline input[type=range] { flex-basis: 150px; } }
   .tag { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 4px; margin-right: 6px; }
   .tag.obs { background: var(--surface-2); color: var(--text-2); border: 1px solid var(--border); }
   .tag.fc { background: var(--accent); color: #fff; }
@@ -135,7 +139,7 @@
         <p class="small" id="acc-note"></p>
       </div>
       <div>
-        <table id="acc-table" aria-label="Accuracy table"></table>
+        <div class="table-wrap"><table id="acc-table" aria-label="Accuracy table"></table></div>
         <p class="small" id="offline-note"></p>
       </div>
     </div>
@@ -144,10 +148,10 @@
   <section class="card">
     <h2>Recent rainy forecasts</h2>
     <p class="small" style="margin-top:-4px">Mean CSI over thresholds and lead times. Click a row to compare forecast and observation.</p>
-    <table id="recent"></table>
+    <div class="table-wrap"><table id="recent"></table></div>
   </section>
 
-  <footer>Radar data: Israel Meteorological Service (ims.gov.il). Basemap © OpenStreetMap contributors © CARTO.
+  <footer>Radar data: Israel Meteorological Service (ims.gov.il). Basemap tiles © Esri — Esri, HERE, Garmin, © OpenStreetMap contributors.
     Forecasts are experimental.</footer>
 </div>
 
@@ -190,11 +194,13 @@ LEGEND.forEach(([c]) => { const s = document.createElement("span"); s.style.back
 const dark = () => matchMedia("(prefers-color-scheme: dark)").matches && document.documentElement.dataset.theme !== "light"
                   || document.documentElement.dataset.theme === "dark";
 function baseLayer() {
-  return L.tileLayer(`https://{s}.basemaps.cartocdn.com/${dark() ? "dark_all" : "light_all"}/{z}/{x}/{y}{r}.png`,
-    {subdomains: "abcd", maxZoom: 12, attribution: "© OpenStreetMap © CARTO"});
+  const style = dark() ? "World_Dark_Gray_Base" : "World_Light_Gray_Base";
+  return L.tileLayer(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/${style}/MapServer/tile/{z}/{y}/{x}`,
+    {maxZoom: 12, attribution: "Tiles © Esri — Esri, HERE, Garmin, © OpenStreetMap contributors"});
 }
 function makeMap(el) {
-  const m = L.map(el, {zoomSnap: 0.5, attributionControl: false}).fitBounds([[29.5, 33.6], [33.4, 36.2]]);
+  // Whole zoom levels only: fractional zoom leaves hairline seams between basemap tiles.
+  const m = L.map(el, {attributionControl: false}).setView([31.9, 35.0], 7);
   baseLayer().addTo(m);
   return m;
 }
@@ -269,7 +275,7 @@ function drawChart() {
   $("key").innerHTML = present.map(m => `<span><span class="swatch" style="background:var(${m.css})"></span> ${m.label}</span>`).join("");
   if (!present.length) { el.innerHTML = `<div class="empty">No evaluated forecasts in this period yet.<br>Each forecast is scored about an hour after it is made.</div>`; return; }
   const leads = acc.summary[present[0].key].lead_minutes;
-  const W = 520, H = 280, P = {l: 38, r: 92, t: 10, b: 30};
+  const W = 520, H = 290, P = {l: 38, r: 92, t: 10, b: 42};
   const vals = present.flatMap(m => acc.summary[m.key].csi[thr]).filter(v => v !== null);
   const ymax = Math.min(1, Math.max(0.2, Math.ceil((Math.max(...vals, 0.05) + 0.05) * 10) / 10));
   const x = l => P.l + (l - leads[0]) / (leads[leads.length - 1] - leads[0]) * (W - P.l - P.r);
@@ -278,8 +284,8 @@ function drawChart() {
   for (let g = 0; g <= ymax + 1e-9; g += ymax > 0.5 ? 0.2 : 0.1) {
     svg += `<line class="gridline" x1="${P.l}" x2="${W - P.r}" y1="${y(g)}" y2="${y(g)}"/><g class="axis"><text x="${P.l - 6}" y="${y(g) + 4}" text-anchor="end">${g.toFixed(1)}</text></g>`;
   }
-  leads.forEach(l => { if (l % 15 === 0 || l === leads[0]) svg += `<g class="axis"><text x="${x(l)}" y="${H - 10}" text-anchor="middle">${l}</text></g>`; });
-  svg += `<g class="axis"><text x="${W - P.r}" y="${H - 10}" text-anchor="start" dx="8">min</text></g>`;
+  leads.forEach(l => { if (l % 15 === 0 || l === leads[0]) svg += `<g class="axis"><text x="${x(l)}" y="${H - P.b + 16}" text-anchor="middle">${l}</text></g>`; });
+  svg += `<g class="axis"><text x="${(P.l + W - P.r) / 2}" y="${H - 4}" text-anchor="middle">lead time (min)</text></g>`;
   const ends = [];
   present.forEach(m => {
     const pts = acc.summary[m.key].csi[thr].map((v, i) => v === null ? null : [x(leads[i]), y(v)]);
@@ -288,7 +294,13 @@ function drawChart() {
     svg += `<path class="series" d="${d}" style="stroke:var(${m.css})"/>`;
     const last = pts.filter(Boolean).pop(); if (last) ends.push({m, y: last[1], x: last[0]});
   });
-  ends.sort((a, b) => a.y - b.y).forEach((e, i, arr) => { if (i && e.y - arr[i - 1].y < 13) e.y = arr[i - 1].y + 13; });
+  // Direct labels at line ends, nudged apart (and kept inside the plot) so they never collide.
+  const GAP = 16, bottom = H - P.b;
+  ends.sort((a, b) => a.y - b.y).forEach((e, i, arr) => { if (i && e.y - arr[i - 1].y < GAP) e.y = arr[i - 1].y + GAP; });
+  for (let i = ends.length - 1; i >= 0; i--) {
+    const limit = i === ends.length - 1 ? bottom : ends[i + 1].y - GAP;
+    if (ends[i].y > limit) ends[i].y = limit;
+  }
   ends.forEach(e => svg += `<text class="label" x="${W - P.r + 8}" y="${e.y + 4}">${e.m.label}</text>`);
   svg += `<line id="xhair" class="gridline" y1="${P.t}" y2="${H - P.b}" style="display:none;stroke:var(--text-3)"/>`;
   svg += `<rect x="${P.l}" y="${P.t}" width="${W - P.l - P.r}" height="${H - P.t - P.b}" fill="transparent" id="hit"/></svg>`;
@@ -339,6 +351,8 @@ async function loadAccuracy() {
   acc = await getJSON(`/api/accuracy?days=${$("days").value}`);
   drawChart(); drawTable(); drawRecent();
 }
+const qsDays = new URLSearchParams(location.search).get("days");
+if (qsDays && [...$("days").options].some(o => o.value === qsDays)) $("days").value = qsDays;
 $("days").onchange = loadAccuracy;
 $("thr").onchange = () => { drawChart(); drawTable(); };
 
