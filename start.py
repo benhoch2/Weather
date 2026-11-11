@@ -1,253 +1,197 @@
-"""
-Single-script launcher for the Weather Radar Prediction System.
+"""Supervisor: runs the fetcher, predictor and web viewer, plus a nightly retrain.
 
-Starts all three components (fetcher, predictor, web viewer) in one process,
-streams their output with labelled prefixes, and shuts everything down cleanly
-on Ctrl+C.
+* Streams each child's output with a coloured prefix.
+* Restarts crashed children with exponential backoff.
+* Predictor exit code 3 (no trained model) is not restarted; the supervisor
+  starts it again once models/current.json appears.
+* Honours data/control.json (the viewer's "Pause forecasts" button).
+* Runs retrain.py once a night at RETRAIN_HOUR (local time).
+* Refuses to start twice (PID lock verified with psutil, works on Windows/Linux).
 
-If any component crashes, the launcher automatically restarts it after a short
-delay — the system self-heals without manual intervention.
-
-Also prevents running the app twice: if start.py is already running, a second
-invocation will refuse to start and tell you to close the first window first.
-
-Usage:
-    python start.py [--port 5050]
+    python start.py [--port 5050] [--host 127.0.0.1] [--no-retrain]
 """
 
+from __future__ import annotations
+
+import argparse
 import os
-# Must be set before TensorFlow loads (MKL C++ reads this at DLL-load time).
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
-
-import sys
 import subprocess
+import sys
 import threading
 import time
-import argparse
 from datetime import datetime
-from pathlib import Path
-from process_utils import is_pid_running
 
-# ── Lock file -----------------------------------------------------------------
-# Prevents double-starting the whole app (e.g. clicking start_viewer.bat twice)
-PROJECT_DIR = Path(__file__).parent
-APP_LOCK = PROJECT_DIR / "app.lock"
-CHILD_LOCKS = [PROJECT_DIR / "predictor.lock", PROJECT_DIR / "fetcher.lock"]
+import psutil
 
-# How long to wait before restarting a crashed component
-RESTART_DELAY = 10
+import config
+from common import LOCAL_TZ, read_json, write_json
 
-
-def _clean_stale_locks() -> None:
-    """Remove child lock files, killing the owner if it is still alive.
-
-    Any process holding a child lock when start.py runs is an orphan from a
-    previous launcher session.  Kill it so the new child can acquire the lock.
-    """
-    for lock in CHILD_LOCKS:
-        if not lock.exists():
-            continue
-        try:
-            pid = int(lock.read_text().strip())
-            if is_pid_running(pid):
-                print(f"[{_ts()}] {_label('LAUNCHER')} Killing orphan PID {pid} holding {lock.name}...")
-                try:
-                    subprocess.run(
-                        ["taskkill", "/PID", str(pid), "/T", "/F"],
-                        capture_output=True, timeout=10,
-                    )
-                except Exception:
-                    pass
-            lock.unlink(missing_ok=True)
-            print(f"[{_ts()}] {_label('LAUNCHER')} Cleared lock: {lock.name}")
-        except Exception:
-            lock.unlink(missing_ok=True)
+APP_LOCK = config.PROJECT_DIR / "app.lock"
+STATUS_FILE = config.STATUS_DIR / "supervisor.json"
+RETRAIN_HOUR = 3
+USE_COLOR = sys.stdout.isatty()
+COLORS = {"FETCHER": "\033[36m", "PREDICTOR": "\033[33m", "WEB": "\033[32m", "RETRAIN": "\033[34m",
+          "SUPERVISOR": "\033[35m"}
 
 
-def acquire_app_lock() -> None:
-    if APP_LOCK.exists():
-        try:
-            pid = int(APP_LOCK.read_text().strip())
-            if is_pid_running(pid):
-                print(f"[LAUNCHER] ERROR: App is already running (PID {pid}).")
-                print(f"[LAUNCHER]   Close that window first, or delete {APP_LOCK} if it is stale.")
-                sys.exit(1)
-        except (ValueError, SystemExit):
-            raise
-        except Exception:
-            pass  # Unreadable / stale — overwrite
+def label(tag: str) -> str:
+    return f"{COLORS.get(tag, '')}[{tag}]\033[0m" if USE_COLOR else f"[{tag}]"
+
+
+def say(msg: str) -> None:
+    print(f"{datetime.now():%H:%M:%S} {label('SUPERVISOR')} {msg}", flush=True)
+
+
+# ── single-instance lock ─────────────────────────────────────────────────────
+
+def acquire_lock() -> None:
+    try:
+        pid = int(APP_LOCK.read_text().strip())
+        proc = psutil.Process(pid)
+        if any("start.py" in part for part in proc.cmdline()):
+            say(f"Already running (PID {pid}). Close it first.")
+            sys.exit(1)
+    except (OSError, ValueError, psutil.Error):
+        pass  # no lock, unreadable, or stale
     APP_LOCK.write_text(str(os.getpid()))
 
 
-def release_app_lock() -> None:
+def release_lock() -> None:
     try:
-        APP_LOCK.unlink(missing_ok=True)
-    except Exception:
+        if APP_LOCK.read_text().strip() == str(os.getpid()):
+            APP_LOCK.unlink()
+    except OSError:
         pass
 
 
-# ── Output streaming ----------------------------------------------------------
-
-USE_COLOR = sys.stdout.isatty()
-
-_COLORS = {
-    "FETCHER":   "\033[36m",   # cyan
-    "PREDICTOR": "\033[33m",   # yellow
-    "WEB":       "\033[32m",   # green
-    "LAUNCHER":  "\033[35m",   # magenta
-}
-_RESET = "\033[0m"
-
-
-def _label(tag: str) -> str:
-    color = _COLORS.get(tag, "") if USE_COLOR else ""
-    reset = _RESET if USE_COLOR else ""
-    return f"{color}[{tag}]{reset}"
-
-
-def _ts() -> str:
-    return datetime.now().strftime("%H:%M:%S")
-
-
-def stream_output(proc: subprocess.Popen, tag: str) -> None:
-    """Read lines from *proc* stdout and print with a labelled prefix (runs in a daemon thread)."""
-    label = _label(tag)
+def kill_tree(proc: subprocess.Popen, timeout: float = 5) -> None:
     try:
-        while True:
-            line = proc.stdout.readline()  # bytes
-            if not line:
-                break
-            line = line.rstrip(b"\r\n").decode(errors="replace")
+        parent = psutil.Process(proc.pid)
+        procs = parent.children(recursive=True) + [parent]
+    except psutil.Error:
+        return
+    for p in procs:
+        try:
+            p.terminate()
+        except psutil.Error:
+            pass
+    _, alive = psutil.wait_procs(procs, timeout=timeout)
+    for p in alive:
+        try:
+            p.kill()
+        except psutil.Error:
+            pass
+
+
+# ── children ─────────────────────────────────────────────────────────────────
+
+class Child:
+    def __init__(self, tag: str, args: list[str], restart: bool = True):
+        self.tag, self.args, self.restart = tag, args, restart
+        self.proc: subprocess.Popen | None = None
+        self.started = 0.0
+        self.failures = 0
+        self.restarts = 0
+        self.next_start = 0.0
+        self.blocked: str | None = None   # reason it must not be (re)started
+
+    @property
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, env: dict) -> None:
+        self.proc = subprocess.Popen([sys.executable, "-u", *self.args], cwd=config.PROJECT_DIR, env=env,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+        self.started = time.monotonic()
+        threading.Thread(target=self._pump, daemon=True).start()
+        say(f"Started {self.tag} (PID {self.proc.pid})")
+
+    def _pump(self) -> None:
+        tag = label(self.tag)
+        for raw in iter(self.proc.stdout.readline, b""):
+            line = raw.rstrip(b"\r\n").decode("utf-8", errors="replace")
             if line:
-                print(f"{label} {line}", flush=True)
-    except Exception:
-        pass
+                print(f"{tag} {line}", flush=True)
 
+    def stop(self) -> None:
+        if self.running:
+            kill_tree(self.proc)
+        self.proc = None
 
-# ── Main ----------------------------------------------------------------------
-
-# Each entry: (tag, command-args builder)
-# The builder is a callable so we can reference args.port lazily.
-_web_debug = False  # Set to True in main() when --web-debug is passed
-
-_COMMANDS = {
-    "FETCHER":   lambda: [sys.executable, "-u", "fetch_radar_continuous.py"],
-    "PREDICTOR": lambda: [sys.executable, "-u", "run_predictions_persistent.py"],
-    "WEB":       lambda: [sys.executable, "-u", "web_viewer.py"] + (["--web-debug"] if _web_debug else []),
-}
-
-
-def _start_process(tag: str, env: dict, project_dir: Path) -> subprocess.Popen:
-    """Spawn a child process for *tag* and wire up its output stream."""
-    proc = subprocess.Popen(
-        _COMMANDS[tag](),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        bufsize=0, cwd=project_dir, env=env,
-    )
-    threading.Thread(
-        target=stream_output, args=(proc, tag), daemon=True,
-    ).start()
-    return proc
+    def status(self) -> dict:
+        return {"running": self.running, "pid": self.proc.pid if self.running else None,
+                "restarts": self.restarts, "blocked": self.blocked}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Weather Radar Prediction System launcher")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("WEATHER_RADAR_VIEWER_PORT", 5050)),
-                        help="Port for the web viewer (default: 5050)")
-    parser.add_argument("--web-debug", action="store_true",
-                        help="Show HTTP access log lines from the web server")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Weather radar nowcast supervisor")
+    ap.add_argument("--host", default=config.VIEWER_HOST)
+    ap.add_argument("--port", type=int, default=config.VIEWER_PORT)
+    ap.add_argument("--no-retrain", action="store_true", help="disable the nightly retrain")
+    ap.add_argument("--web-debug", action="store_true")
+    a = ap.parse_args()
 
-    global _web_debug
-    _web_debug = args.web_debug
-
-    acquire_app_lock()
-
-    # Clean any stale child locks *before* starting children
-    _clean_stale_locks()
-
-    env = {
-        **os.environ,
-        "PYTHONUNBUFFERED": "1",
-        "TF_ENABLE_ONEDNN_OPTS": "0",
-        "WEATHER_RADAR_VIEWER_PORT": str(args.port),
-        "PYTHONIOENCODING": "utf-8",
+    acquire_lock()
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
+    web_args = ["web_viewer.py", "--host", a.host, "--port", str(a.port)] + (["--web-debug"] if a.web_debug else [])
+    children = {
+        "FETCHER": Child("FETCHER", ["fetcher.py"]),
+        "PREDICTOR": Child("PREDICTOR", ["predictor.py"]),
+        "WEB": Child("WEB", web_args),
     }
+    retrain = Child("RETRAIN", ["retrain.py"], restart=False)
+    last_retrain_day = None
 
-    project_dir = PROJECT_DIR
-    processes: dict[str, subprocess.Popen] = {}
-
-    print("=" * 65)
-    print(" Weather Radar Prediction System")
-    print(f" Starting at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 65)
-
+    say(f"Open http://{'localhost' if a.host == '127.0.0.1' else a.host}:{a.port}  (Ctrl+C to stop)")
     try:
-        # ── Initial launch ────────────────────────────────────────────────────
-        for tag in ("FETCHER", "PREDICTOR", "WEB"):
-            label_text = {
-                "FETCHER": "radar fetcher",
-                "PREDICTOR": "prediction engine",
-                "WEB": f"web viewer on http://localhost:{args.port}",
-            }[tag]
-            print(f"[{_ts()}] {_label('LAUNCHER')} Starting {label_text}...")
-            processes[tag] = _start_process(tag, env, project_dir)
-
-        print(f"[{_ts()}] {_label('LAUNCHER')} Open http://localhost:{args.port} in your browser")
-        print(f"[{_ts()}] {_label('LAUNCHER')} Press Ctrl+C to stop everything")
-        print("=" * 65)
-
-        # ── Monitor + auto-restart loop ───────────────────────────────────────
         while True:
-            time.sleep(5)
-            for tag in list(processes):
-                proc = processes[tag]
-                code = proc.poll()
-                if code is None:
-                    continue  # Still running — nothing to do
+            control = read_json(config.CONTROL_FILE, {}) or {}
+            pred = children["PREDICTOR"]
+            pred_enabled = control.get("predictor_enabled", True)
+            if not pred_enabled and pred.running:
+                say("Forecasts paused from the viewer - stopping PREDICTOR")
+                pred.stop()
+            pred.blocked = "paused" if not pred_enabled else (
+                pred.blocked if pred.blocked == "no_model" and not config.CURRENT_MODEL_FILE.exists() else None)
 
-                print(
-                    f"[{_ts()}] {_label('LAUNCHER')} WARNING: {tag} exited with code {code}",
-                    flush=True,
-                )
+            now = time.monotonic()
+            for child in children.values():
+                if child.proc is not None and not child.running:
+                    code = child.proc.returncode
+                    child.proc = None
+                    if child.tag == "PREDICTOR" and code == config.EXIT_NO_MODEL:
+                        child.blocked = "no_model"
+                        say("PREDICTOR has no trained model - waiting for models/current.json (run train.py)")
+                        continue
+                    ran = now - child.started
+                    child.failures = 0 if ran > 600 else child.failures + 1
+                    delay = min(300, 10 * 2 ** max(0, child.failures - 1))
+                    child.next_start = now + delay
+                    say(f"{child.tag} exited with code {code} - restarting in {delay}s")
+                if not child.running and not child.blocked and now >= child.next_start:
+                    if child.started:
+                        child.restarts += 1
+                    child.start(env)
 
-                # Clean stale child locks so the restart can acquire them
-                _clean_stale_locks()
+            local_now = datetime.now(LOCAL_TZ)
+            if (not a.no_retrain and local_now.hour == RETRAIN_HOUR and last_retrain_day != local_now.date()
+                    and not retrain.running):
+                last_retrain_day = local_now.date()
+                say("Starting nightly retrain check")
+                retrain.start(env)
 
-                print(
-                    f"[{_ts()}] {_label('LAUNCHER')} Restarting {tag} in {RESTART_DELAY}s...",
-                    flush=True,
-                )
-                time.sleep(RESTART_DELAY)
-
-                # Double-check that we still need to restart (user might Ctrl+C
-                # during the delay, which raises KeyboardInterrupt)
-                processes[tag] = _start_process(tag, env, project_dir)
-                print(
-                    f"[{_ts()}] {_label('LAUNCHER')} {tag} restarted (PID {processes[tag].pid})",
-                    flush=True,
-                )
-
+            write_json(STATUS_FILE, {"updated_at": int(time.time()), "pid": os.getpid(),
+                                     "children": {t: c.status() for t, c in children.items()},
+                                     "retrain_running": retrain.running})
+            time.sleep(3)
     except KeyboardInterrupt:
-        print(f"\n[{_ts()}] {_label('LAUNCHER')} Ctrl+C received — stopping all processes...")
-        for tag, proc in processes.items():
-            if proc.poll() is None:
-                print(f"[{_ts()}] {_label('LAUNCHER')}   Stopping {tag}...")
-                proc.terminate()
-
-        time.sleep(3)
-
-        for tag, proc in processes.items():
-            if proc.poll() is None:
-                print(f"[{_ts()}] {_label('LAUNCHER')}   Force-killing {tag}...")
-                proc.kill()
-
-        print(f"[{_ts()}] {_label('LAUNCHER')} All processes stopped. Goodbye!")
-
+        say("Stopping...")
     finally:
-        # Clean child locks so the next start is clean
-        _clean_stale_locks()
-        release_app_lock()
+        for child in [*children.values(), retrain]:
+            child.stop()
+        write_json(STATUS_FILE, {"updated_at": int(time.time()), "stopped": True})
+        release_lock()
+        say("All stopped.")
 
 
 if __name__ == "__main__":

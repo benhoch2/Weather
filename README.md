@@ -1,160 +1,74 @@
-# Weather Radar Prediction System
+# Rain Nowcast
 
-A machine learning system that collects radar images and learns to predict future weather patterns.
+Short-term rain forecasts (0–60 minutes) for Israel from the Israel Meteorological Service (IMS) rain radar,
+using a U-Net trained on the GPU and scored against simple baselines.
 
-## Overview
+## How it works
 
-This system continuously collects weather radar images from Weather2day.co.il and uses a deep learning model (ConvLSTM) to predict the next radar image based on the previous hour of data (12 images at 5-minute intervals).
+1. **Data.** IMS publishes a transparent 940×940 rain-only radar image every 5 minutes, and keeps an archive
+   back to at least January 2025. Each pixel's color is converted to a rain rate in mm/h using the IMS legend.
+   Frames are stored by their real observation time (UTC).
+2. **Model.** A U-Net takes the last 12 frames (60 minutes) at 256×256 and predicts the next 12 frames
+   (+5 … +60 minutes) in one pass. The loss weights heavier rain more, so "no rain everywhere" can't score well.
+3. **Scoring.** Each forecast is checked against what actually happened, and so are two baselines:
+   *persistence* (rain stays where it is) and *optical flow* (rain keeps moving along its current track,
+   computed with pysteps). Scores are CSI, POD and FAR at 0.5, 2 and 5 mm/h, plus MAE in mm/h.
+   CSI is the share of rain areas forecast correctly, counting misses and false alarms; 1 is perfect.
+4. **Learning.** The live system never changes model weights. Once a night in rainy weather, `retrain.py`
+   fine-tunes on all data. The new model replaces the live one only if it scores better on held-out days.
+
+## Setup (Windows, NVIDIA GPU)
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -c "import torch; print(torch.cuda.get_device_name(0))"
+```
+
+RTX 50-series (Blackwell) cards need a CUDA 12.8+ build of PyTorch, as above. TensorFlow has no GPU
+support on native Windows. Without a GPU everything still runs on the CPU, but training is very slow.
+
+## First run
+
+```powershell
+# 1. Download history: hourly scan since Jan 2025, then every 5-minute frame around rainy hours.
+#    Takes several hours; it is throttled and resumable (just run it again).
+.\.venv\Scripts\python.exe backfill.py
+
+# 2. Score the baselines on held-out days. This is the bar the model must beat.
+.\.venv\Scripts\python.exe evaluate.py --split test --methods persistence,optflow
+
+# 3. Train on the GPU (check the pipeline first with --smoke), then compare on the test days.
+.\.venv\Scripts\python.exe train.py --smoke
+.\.venv\Scripts\python.exe train.py
+.\.venv\Scripts\python.exe evaluate.py --split test
+
+# 4. Run everything: fetcher + live forecasts + web viewer at http://localhost:5050
+start_viewer.bat
+```
 
 ## Files
 
-1. **fetch_radar.py** - Single image fetcher (for testing)
-2. **fetch_radar_continuous.py** - Continuously fetches radar images every 5 minutes
-3. **data_manager.py** - Manages radar image data and creates training sequences
-4. **radar_model.py** - ConvLSTM neural network model for radar prediction
-5. **train_model.py** - Initial training script
-6. **predict_continuous.py** - Continuous prediction and online learning
-7. **web_viewer.py** - Web interface to view predictions and metrics
+| File | Purpose |
+|---|---|
+| `config.py` | Paths, timing, model size, IMS URLs, legend and map bounds |
+| `ims_source.py` | IMS listing, archive URLs, downloads, color → mm/h decoding and rendering |
+| `radar_store.py` | Raw archive in `data/ims/raw/`, gap tracking, per-day 256×256 cache (`python radar_store.py` builds it in parallel) |
+| `backfill.py` | Historical downloader (`--from/--to`, `--all`) |
+| `fetcher.py` | Live polling, plus repair of any gaps in the last 48 hours |
+| `dataset.py` | Time-ordered frames, gap-free windows, train/val/test split by whole days |
+| `model.py` / `train.py` | U-Net, checkpoints, GPU training, promote-if-better |
+| `metrics.py` / `baselines.py` / `evaluate.py` | Scores, persistence and optical-flow baselines, offline reports in `data/eval/` |
+| `predictor.py` | Live forecasts in `data/predictions/<t0>/`, scoring, and `ledger.jsonl` |
+| `retrain.py` | Nightly gated fine-tuning (`--force` to run now) |
+| `web_viewer.py` | Map with observed and forecast frames, accuracy charts, and system status |
+| `start.py` | Supervisor: restarts crashed parts, honors the viewer's pause button, runs the nightly retrain |
 
-## Setup
+## Notes
 
-1. Install required packages:
-```bash
-python -m pip install tensorflow numpy pillow requests flask
-```
-
-2. Start collecting radar images:
-```bash
-python fetch_radar_continuous.py
-```
-Let it run for at least 65 minutes to collect enough images for training (13 images minimum).
-
-## Usage
-
-### Step 1: Collect Images
-Run the continuous fetcher to build your dataset:
-```bash
-python fetch_radar_continuous.py
-```
-
-Keep this running to continuously collect radar images. The more images you collect, the better your model will be.
-
-By default the fetcher now keeps all collected radar images so you can build a larger training set over time.
-If you want automatic pruning, set `WEATHER_RADAR_MAX_IMAGES` to a positive integer before starting the fetcher.
-
-### Step 2: Train Initial Model
-Once you have at least 13 images (recommended: 50+ images for better results):
-```bash
-python train_model.py
-```
-
-Optional parameters:
-```bash
-python train_model.py [epochs] [batch_size]
-# Example: python train_model.py 100 4
-```
-
-This will:
-- Load all collected radar images
-- Create training sequences (12 images → 1 target image)
-- Train a ConvLSTM model
-- Save the trained model as `radar_model.keras`
-
-### Step 3: Continuous Prediction and Learning
-Once you have a trained model, start the continuous prediction system:
-```bash
-python predict_continuous.py
-```
-
-This script will:
-1. Wait for enough images (12) to make predictions
-2. **Predict the next 5 radar images** (5, 10, 15, 20, 25 minutes ahead)
-3. Save predictions as individual frames and animated GIF
-4. Wait 25 minutes for the actual images to arrive
-5. Compare predictions with actual images (calculate MSE, MAE, PSNR for each frame)
-6. Create animated GIF showing predicted vs actual side-by-side
-7. Update the model weights based on the error (online learning)
-8. Repeat indefinitely
-
-The model continuously improves as it sees more real-world data!
-
-### Step 4: View Predictions in Browser
-Start the web interface to see all predictions and metrics in your browser:
-```bash
-python web_viewer.py
-```
-
-By default the viewer runs on **http://localhost:5050**.
-
-If you want a different port:
-```bash
-$env:WEATHER_RADAR_VIEWER_PORT=8080
-python web_viewer.py
-```
-
-The viewer can start and stop the prediction worker from the browser UI, but it does **not** start the radar fetcher.
-Keep `fetch_radar_continuous.py` running in a separate terminal if you want live incoming data.
-
-The web interface shows:
-- All prediction comparisons (predicted vs actual side-by-side)
-- **Animated GIFs showing 5-frame predictions**
-- Metrics for each prediction (MSE, MAE, PSNR)
-- Average metrics across all 5 frames
-- Overall statistics
-- Auto-refreshes every 30 seconds
-- Click any image to view full-size
-
-## How It Works
-
-### Architecture
-The system uses a **ConvLSTM (Convolutional LSTM)** architecture:
-- Input: 12 consecutive radar images (256x256 or 512x512 RGB)
-- ConvLSTM layers capture both spatial (weather patterns) and temporal (movement) features
-- Output: Single predicted radar image (5 minutes into the future)
-- **Multi-frame prediction:** Recursively predicts 5 frames (25 minutes ahead) by feeding predictions back as input
-
-### Online Learning
-After each prediction:
-1. The system waits for the actual radar image
-2. Calculates prediction error
-3. Updates model weights using backpropagation
-4. The model gets better over time with each prediction!
-
-### Key Features
-- **No powerful GPU needed**: Trains/predicts every 5 minutes, plenty of time even on CPU
-- **Continuous improvement**: Model updates itself with each new prediction
-- **Metrics tracking**: MSE, MAE, and PSNR to measure prediction quality
-- **Comparison images**: Saves side-by-side comparisons of predicted vs actual
-
-## File Outputs
-
-- `radar_TIMESTAMP.png` - Original radar images
-- `predicted_TIMESTAMP.png` / `predicted_TIMESTAMP_frameN.png` - Predicted images
-- `prediction_comparison_TIMESTAMP.png` - Side-by-side comparison (predicted | actual)
-- `prediction_animation_TIMESTAMP.gif` - Animated GIF showing 5-frame prediction vs actual
-- `metrics_TIMESTAMP.json` - Prediction metrics (MSE, MAE, PSNR) for each frame
-- `radar_model.keras` - Trained model
-- `training_metadata.json` - Training statistics and metadata
-
-## Tips
-
-1. **Collect more data**: The more radar images you collect, the better the model performs
-2. **Be patient**: Initial predictions may not be great, but the model improves over time
-3. **Monitor metrics**: Watch the MSE/MAE values decrease as the model learns
-4. **Retrain periodically**: After collecting a large dataset, you can retrain from scratch for better results
-
-## Requirements
-
-- Python 3.8+
-- TensorFlow 2.x
-- NumPy
-- Pillow (PIL)
-- Requests
-- Flask
-
-## Future Enhancements
-
-- Add weather condition classification (rain/no rain)
-- Predict multiple time steps (10, 15, 30 minutes ahead)
-- Add attention mechanisms for better long-term predictions
-- Ensemble multiple models for improved accuracy
+- The viewer listens only on `127.0.0.1`. Use `start.py --host 0.0.0.0` to open it to your network; it has no login.
+- The IMS archive has outages (missing frames). Training only uses gap-free windows. The live predictor
+  tolerates one missing input frame.
+- Radar data © Israel Meteorological Service. Check the IMS terms of use before redistributing data or forecasts.
+- Run the tests with `.\.venv\Scripts\python.exe -m pytest tests`.

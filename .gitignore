@@ -1,55 +1,19 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
 .venv/
-ENV/
+venv/
+.pytest_cache/
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Runtime data, models and locks (never commit)
+data/
+models/
+*.lock
+*.log
 
-# TensorFlow / Keras
-*.keras
-*.h5
-*.pb
-
-# Data files - images and predictions
-data/radar_images/
-data/predictions/
-radar_*.png
-predicted_*.png
-prediction_*.png
-prediction_*.gif
-actual_*.png
-
-# Metadata files
-*.json
-!package.json
-
-# Flask
-instance/
-.webassets-cache
-
-# IDEs
+# Editors / OS
 .vscode/
 .idea/
 *.swp
-*.swo
-*~
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log
-
-# Runtime lock files (track running process PIDs - never commit these)
-*.lock
-
-# Debug output
-predict_output.txt
