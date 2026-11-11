@@ -10,7 +10,6 @@ import argparse
 import os
 import re
 import time
-from pathlib import Path
 
 import config
 from common import read_json
